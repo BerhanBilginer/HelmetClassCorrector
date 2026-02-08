@@ -1,0 +1,128 @@
+{
+    "helmet": {
+        "images": [
+            {
+                "filename": "Screenshot from 2026-02-08 13-52-35.png",
+                "yolo_prediction": "helmet",
+                "our_prediction": "no_helmet",
+                "confidence": 0.603084135055542,
+                "feature_prediction": "no_helmet",
+                "feature_confidence": 0.7630829811096191,
+                "cnn_prediction": "helmet",
+                "cnn_confidence": 0.5035817623138428,
+                "agreement": false
+            },
+            {
+                "filename": "Screenshot from 2026-02-08 13-52-46.png",
+                "yolo_prediction": "helmet",
+                "our_prediction": "no_helmet",
+                "confidence": 0.8668967819600588,
+                "feature_prediction": "no_helmet",
+                "feature_confidence": 0.6672419309616089,
+                "cnn_prediction": "no_helmet",
+                "cnn_confidence": 1.0,
+                "agreement": false
+            },
+            {
+                "filename": "Screenshot from 2026-02-08 13-52-53.png",
+                "yolo_prediction": "helmet",
+                "our_prediction": "helmet",
+                "confidence": 0.5888469696044921,
+                "feature_prediction": "no_helmet",
+                "feature_confidence": 0.7384320497512817,
+                "cnn_prediction": "helmet",
+                "cnn_confidence": 0.8070330023765564,
+                "agreement": true
+            },
+            {
+                "filename": "Screenshot from 2026-02-08 13-52-49.png",
+                "yolo_prediction": "helmet",
+                "our_prediction": "helmet",
+                "confidence": 0.6616312146186829,
+                "feature_prediction": "no_helmet",
+                "feature_confidence": 0.7554761171340942,
+                "cnn_prediction": "helmet",
+                "cnn_confidence": 0.9397027492523193,
+                "agreement": true
+            },
+            {
+                "filename": "Screenshot from 2026-02-08 13-52-41.png",
+                "yolo_prediction": "helmet",
+                "our_prediction": "helmet",
+                "confidence": 0.8066362142562866,
+                "feature_prediction": "helmet",
+                "feature_confidence": 0.5166761875152588,
+                "cnn_prediction": "helmet",
+                "cnn_confidence": 0.9999428987503052,
+                "agreement": true
+            }
+        ],
+        "yolo_correct": 3,
+        "yolo_wrong": 2,
+        "corrected": 0,
+        "still_wrong": 0
+    },
+    "no_helmet": {
+        "images": [
+            {
+                "filename": "Screenshot from 2026-02-08 13-51-07.png",
+                "yolo_prediction": "no_helmet",
+                "our_prediction": "helmet",
+                "confidence": 0.7218095064163208,
+                "feature_prediction": "helmet",
+                "feature_confidence": 0.5167987942695618,
+                "cnn_prediction": "helmet",
+                "cnn_confidence": 0.8584833145141602,
+                "agreement": false
+            },
+            {
+                "filename": "Screenshot from 2026-02-08 13-51-45.png",
+                "yolo_prediction": "no_helmet",
+                "our_prediction": "helmet",
+                "confidence": 0.6920524835586548,
+                "feature_prediction": "no_helmet",
+                "feature_confidence": 0.7698657512664795,
+                "cnn_prediction": "helmet",
+                "cnn_confidence": 0.9999979734420776,
+                "agreement": false
+            },
+            {
+                "filename": "Screenshot from 2026-02-08 13-52-00.png",
+                "yolo_prediction": "no_helmet",
+                "our_prediction": "no_helmet",
+                "confidence": 0.9277868140488863,
+                "feature_prediction": "no_helmet",
+                "feature_confidence": 0.8265405893325806,
+                "cnn_prediction": "no_helmet",
+                "cnn_confidence": 0.995284378528595,
+                "agreement": true
+            },
+            {
+                "filename": "Screenshot from 2026-02-08 13-51-35.png",
+                "yolo_prediction": "no_helmet",
+                "our_prediction": "no_helmet",
+                "confidence": 0.5327645480632782,
+                "feature_prediction": "helmet",
+                "feature_confidence": 0.5377488136291504,
+                "cnn_prediction": "no_helmet",
+                "cnn_confidence": 0.5797734260559082,
+                "agreement": true
+            },
+            {
+                "filename": "Screenshot from 2026-02-08 13-51-27.png",
+                "yolo_prediction": "no_helmet",
+                "our_prediction": "helmet",
+                "confidence": 0.7402518510818481,
+                "feature_prediction": "no_helmet",
+                "feature_confidence": 0.5885089039802551,
+                "cnn_prediction": "helmet",
+                "cnn_confidence": 0.959425687789917,
+                "agreement": false
+            }
+        ],
+        "yolo_correct": 2,
+        "yolo_wrong": 3,
+        "corrected": 0,
+        "still_wrong": 0
+    }
+}
