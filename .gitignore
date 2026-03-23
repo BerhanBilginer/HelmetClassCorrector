@@ -46,6 +46,16 @@ test/cropped_images/
 .DS_Store
 Thumbs.db
 
+# Generated outputs
+yolo_simulation_results.json
+yolo_simulation_visualization.png
+cnn_classifier_best.pth
+cnn_classifier_training_history.png
+cnn_classifier_confusion_matrix.png
+feature_classifier_*.png
+image_analysis.xlsx
+image_analysis.csv
+
 # Temporary files
 *.tmp
 *.log

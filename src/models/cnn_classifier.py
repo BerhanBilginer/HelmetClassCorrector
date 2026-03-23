@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
 from PIL import Image
 import numpy as np
 from pathlib import Path
@@ -233,6 +235,150 @@ class ColorAwareHelmetCNN(nn.Module):
         return self.classifier(fused)
 
 
+class ChannelAttention(nn.Module):
+    """CBAM Channel Attention — hangi feature map'ler önemli."""
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        reduced = max(4, channels // reduction)
+        self.shared_mlp = nn.Sequential(
+            nn.Linear(channels, reduced, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(reduced, channels, bias=False)
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        avg_pool = F.adaptive_avg_pool2d(x, 1).view(b, c)
+        max_pool = F.adaptive_max_pool2d(x, 1).view(b, c)
+        attention = torch.sigmoid(self.shared_mlp(avg_pool) + self.shared_mlp(max_pool))
+        return x * attention.view(b, c, 1, 1)
+
+
+class SpatialAttention(nn.Module):
+    """CBAM Spatial Attention — görüntünün neresine bakmalı."""
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size,
+                              padding=kernel_size // 2, bias=False)
+
+    def forward(self, x):
+        avg_out = x.mean(dim=1, keepdim=True)
+        max_out = x.max(dim=1, keepdim=True)[0]
+        attention = torch.sigmoid(self.conv(torch.cat([avg_out, max_out], dim=1)))
+        return x * attention
+
+
+class CBAM(nn.Module):
+    """Convolutional Block Attention Module = Channel + Spatial."""
+    def __init__(self, channels, reduction=16, spatial_kernel=7):
+        super().__init__()
+        self.channel_att = ChannelAttention(channels, reduction)
+        self.spatial_att = SpatialAttention(spatial_kernel)
+
+    def forward(self, x):
+        x = self.channel_att(x)
+        x = self.spatial_att(x)
+        return x
+
+
+class HelmetClassifierNet(nn.Module):
+    """
+    Production-grade helmet classifier.
+
+    EfficientNet-B0 backbone (pretrained ImageNet) + CBAM + FPN + Color Branch.
+
+    Mimari:
+      - Backbone: EfficientNet-B0 features, 3 ölçek çıkarma (40ch, 112ch, 1280ch)
+      - Attention: Her ölçekte CBAM (Channel + Spatial)
+      - FPN: Top-down lateral bağlantılar, tüm ölçekler 128-dim'e projekte
+      - Color Branch: Öğrenilen renk uzayı dönüşümü (1x1 conv) → 64-dim
+      - Classifier: (128 + 64) = 192 → 128 → 64 → 2
+
+    Giriş: 224x224 RGB
+    ~5.9M parametre (5.3M backbone, ~600K trainable head)
+    2-fazlı eğitim: Phase 1 backbone frozen, Phase 2 full fine-tune
+    """
+    def __init__(self, num_classes=2, pretrained=True):
+        super().__init__()
+
+        weights = EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
+        backbone = efficientnet_b0(weights=weights)
+
+        self.stage1 = backbone.features[:4]   # → 40ch,  28x28  (texture)
+        self.stage2 = backbone.features[4:6]  # → 112ch, 14x14  (mid semantics)
+        self.stage3 = backbone.features[6:]   # → 1280ch, 7x7   (high semantics)
+
+        self.cbam1 = CBAM(40, reduction=8)
+        self.cbam2 = CBAM(112, reduction=16)
+        self.cbam3 = CBAM(1280, reduction=16)
+
+        self.lateral3 = nn.Conv2d(1280, 128, kernel_size=1, bias=False)
+        self.lateral2 = nn.Conv2d(112, 128, kernel_size=1, bias=False)
+        self.lateral1 = nn.Conv2d(40, 128, kernel_size=1, bias=False)
+        self.smooth2 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
+        self.smooth1 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
+
+        self.color_branch = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.AvgPool2d(4),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(128 + 64, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.4),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(64, num_classes)
+        )
+
+    def freeze_backbone(self):
+        """Backbone parametrelerini dondurur (transfer learning Phase 1)."""
+        for stage in [self.stage1, self.stage2, self.stage3]:
+            for param in stage.parameters():
+                param.requires_grad = False
+
+    def unfreeze_backbone(self):
+        """Backbone parametrelerini açar (transfer learning Phase 2)."""
+        for stage in [self.stage1, self.stage2, self.stage3]:
+            for param in stage.parameters():
+                param.requires_grad = True
+
+    def forward(self, x):
+        color_feat = self.color_branch(x).view(x.size(0), -1)
+
+        c3 = self.stage1(x)
+        c4 = self.stage2(c3)
+        c5 = self.stage3(c4)
+
+        c3 = self.cbam1(c3)
+        c4 = self.cbam2(c4)
+        c5 = self.cbam3(c5)
+
+        p5 = self.lateral3(c5)
+        p4 = self.smooth2(self.lateral2(c4) + F.interpolate(p5, size=c4.shape[2:], mode='nearest'))
+        p3 = self.smooth1(self.lateral1(c3) + F.interpolate(p4, size=c3.shape[2:], mode='nearest'))
+
+        p5_pool = F.adaptive_avg_pool2d(p5, 1).view(x.size(0), -1)
+        p4_pool = F.adaptive_avg_pool2d(p4, 1).view(x.size(0), -1)
+        p3_pool = F.adaptive_avg_pool2d(p3, 1).view(x.size(0), -1)
+        fpn_feat = p5_pool + p4_pool + p3_pool
+
+        fused = torch.cat([fpn_feat, color_feat], dim=1)
+        return self.classifier(fused)
+
+
 class CNNClassifier:
     """
     CNN-based helmet classifier.
@@ -254,7 +400,32 @@ class CNNClassifier:
         
         self.model_type = model_type
         
-        if model_type == 'color_aware':
+        if model_type == 'efficientnet':
+            self.model = HelmetClassifierNet(num_classes=2, pretrained=True).to(self.device)
+            self.model.freeze_backbone()
+            img_size = 224
+            print(f"🧠 Model: HelmetClassifierNet (EfficientNet-B0 + CBAM + FPN + Color, {img_size}x{img_size})")
+            
+            self.train_transform = transforms.Compose([
+                transforms.Resize((256, 256)),
+                transforms.RandomResizedCrop(img_size, scale=(0.7, 1.0)),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomAffine(degrees=20, scale=(0.8, 1.2), translate=(0.1, 0.1)),
+                transforms.RandomPerspective(distortion_scale=0.3, p=0.4),
+                transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.15),
+                transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
+                transforms.RandomGrayscale(p=0.05),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                transforms.RandomErasing(p=0.2, scale=(0.02, 0.15)),
+            ])
+            
+            self.test_transform = transforms.Compose([
+                transforms.Resize((img_size, img_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+        elif model_type == 'color_aware':
             self.model = ColorAwareHelmetCNN(num_classes=2).to(self.device)
             img_size = 128
             print(f"🧠 Model: ColorAwareHelmetCNN (SE-Residual + Color Branch, {img_size}x{img_size})")
@@ -318,27 +489,18 @@ class CNNClassifier:
         print(f"✓ Val: {len(val_dataset)} samples")
         print(f"✓ Test: {len(test_dataset)} samples")
     
-    def train(self, num_epochs=20, learning_rate=0.001):
+    def _run_epochs(self, num_epochs, criterion, optimizer, scheduler, best_val_acc, epoch_offset=0):
         """
-        Modeli eğitir.
+        Epoch döngüsü — train() tarafından çağrılır.
         """
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5)
-        
-        best_val_acc = 0.0
-        
-        print(f"\n🎯 CNN modeli eğitiliyor...")
-        print(f"Epochs: {num_epochs}, Learning Rate: {learning_rate}")
-        print("="*60)
-        
         for epoch in range(num_epochs):
+            global_epoch = epoch_offset + epoch + 1
             self.model.train()
             train_loss = 0.0
             train_correct = 0
             train_total = 0
             
-            pbar = tqdm(self.train_loader, desc=f'Epoch {epoch+1}/{num_epochs}')
+            pbar = tqdm(self.train_loader, desc=f'Epoch {global_epoch}')
             for images, labels in pbar:
                 images, labels = images.to(self.device), labels.to(self.device)
                 
@@ -368,11 +530,16 @@ class CNNClassifier:
             self.train_accs.append(train_acc)
             self.val_accs.append(val_acc)
             
-            scheduler.step(val_loss)
+            if hasattr(scheduler, 'step'):
+                if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step(val_loss)
+                else:
+                    scheduler.step()
             
-            print(f"Epoch {epoch+1}/{num_epochs}")
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"Epoch {global_epoch}")
             print(f"  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
-            print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+            print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, LR: {current_lr:.6f}")
             
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
@@ -380,6 +547,58 @@ class CNNClassifier:
                 print(f"  ✓ Best model saved! (Val Acc: {val_acc:.2f}%)")
             
             print("-"*60)
+        
+        return best_val_acc
+
+    def train(self, num_epochs=20, learning_rate=0.001):
+        """
+        Modeli eğitir.
+        EfficientNet modeli için 2-fazlı transfer learning uygular:
+          Phase 1: Backbone frozen, sadece head eğitilir
+          Phase 2: Tüm ağ fine-tune edilir (düşük lr)
+        """
+        criterion = nn.CrossEntropyLoss()
+        best_val_acc = 0.0
+        
+        if self.model_type == 'efficientnet':
+            phase1_epochs = max(5, num_epochs // 3)
+            phase2_epochs = num_epochs - phase1_epochs
+            
+            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in self.model.parameters())
+            
+            print(f"\n🎯 Phase 1: Backbone frozen ({phase1_epochs} epoch, lr={learning_rate})")
+            print(f"   Eğitilebilir: {trainable:,} / {total:,} parametre")
+            print("="*60)
+            
+            self.model.freeze_backbone()
+            optimizer = optim.Adam(
+                filter(lambda p: p.requires_grad, self.model.parameters()),
+                lr=learning_rate, weight_decay=1e-4
+            )
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=phase1_epochs)
+            best_val_acc = self._run_epochs(phase1_epochs, criterion, optimizer, scheduler, best_val_acc)
+            
+            print(f"\n🎯 Phase 2: Full fine-tuning ({phase2_epochs} epoch, lr={learning_rate * 0.1})")
+            self.model.unfreeze_backbone()
+            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            print(f"   Eğitilebilir: {trainable:,} / {total:,} parametre")
+            print("="*60)
+            
+            optimizer = optim.Adam(self.model.parameters(), lr=learning_rate * 0.1, weight_decay=1e-4)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=phase2_epochs)
+            best_val_acc = self._run_epochs(
+                phase2_epochs, criterion, optimizer, scheduler, best_val_acc,
+                epoch_offset=phase1_epochs
+            )
+        else:
+            print(f"\n🎯 CNN modeli eğitiliyor...")
+            print(f"Epochs: {num_epochs}, Learning Rate: {learning_rate}")
+            print("="*60)
+            
+            optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5)
+            best_val_acc = self._run_epochs(num_epochs, criterion, optimizer, scheduler, best_val_acc)
         
         print(f"\n✅ Training tamamlandı! Best Val Acc: {best_val_acc:.2f}%")
         self.plot_training_history()
@@ -550,7 +769,10 @@ class CNNClassifier:
         if saved_type != self.model_type:
             print(f"⚠️  Checkpoint model_type='{saved_type}', yeniden oluşturuluyor...")
             self.model_type = saved_type
-            if saved_type == 'color_aware':
+            if saved_type == 'efficientnet':
+                self.model = HelmetClassifierNet(num_classes=2, pretrained=False).to(self.device)
+                img_size = 224
+            elif saved_type == 'color_aware':
                 self.model = ColorAwareHelmetCNN(num_classes=2).to(self.device)
                 img_size = 128
             else:
@@ -572,9 +794,9 @@ class CNNClassifier:
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='CNN Helmet Classifier Training')
-    parser.add_argument('--model', type=str, default='color_aware',
-                        choices=['lightweight', 'color_aware'],
-                        help='Model mimarisi: lightweight (3 Conv) veya color_aware (SE-Res + Color Branch)')
+    parser.add_argument('--model', type=str, default='efficientnet',
+                        choices=['lightweight', 'color_aware', 'efficientnet'],
+                        help='Model mimarisi: lightweight | color_aware | efficientnet (EfficientNet-B0 + CBAM + FPN)')
     parser.add_argument('--epochs', type=int, default=30, help='Epoch sayısı')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
     parser.add_argument('--batch-size', type=int, default=32, help='Batch size')

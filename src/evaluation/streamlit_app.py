@@ -124,6 +124,16 @@ def main():
     
     with st.spinner('Görüntüler analiz ediliyor...'):
         df, analyzer = load_and_analyze_data()
+
+    if df is None or df.empty:
+        st.error("Analiz edilecek görüntü bulunamadı. 'helmet' ve 'no_helmet' klasörlerinde .png dosyaları olduğundan emin ol.")
+        st.stop()
+
+    required_columns = {'category'}
+    missing_columns = required_columns - set(df.columns)
+    if missing_columns:
+        st.error(f"Analiz sonucu beklenen kolonlar bulunamadı: {', '.join(sorted(missing_columns))}.")
+        st.stop()
     
     helmet_data = df[df['category'] == 'helmet']
     no_helmet_data = df[df['category'] == 'no_helmet']

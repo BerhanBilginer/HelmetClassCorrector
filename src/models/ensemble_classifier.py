@@ -41,11 +41,11 @@ class EnsembleClassifier:
     
     def load_cnn_model(self, model_path):
         """
-        CNN modeli yükler.
+        CNN modeli yükler. Checkpoint'taki model_type otomatik algılanır.
         """
-        self.cnn_classifier = CNNClassifier()
+        self.cnn_classifier = CNNClassifier(model_type='lightweight')
         self.cnn_classifier.load(model_path)
-        print(f"✓ CNN model yüklendi: {model_path}")
+        print(f"✓ CNN model yüklendi: {model_path} (type: {self.cnn_classifier.model_type})")
     
     def predict(self, image_path, return_details=False):
         """

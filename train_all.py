@@ -77,9 +77,9 @@ def main():
     try:
         from src.models.cnn_classifier import CNNClassifier
         
-        classifier = CNNClassifier()
-        classifier.prepare_data(dataset_dir, batch_size=32)
-        classifier.train(num_epochs=20, learning_rate=0.001)
+        classifier = CNNClassifier(model_type='efficientnet')
+        classifier.prepare_data(dataset_dir, batch_size=16)
+        classifier.train(num_epochs=30, learning_rate=0.001)
         classifier.load('cnn_classifier_best.pth')
         results = classifier.evaluate()
         

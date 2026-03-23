@@ -195,9 +195,9 @@ def visualize_results(test_dir, results):
     plt.close()
 
 if __name__ == "__main__":
-    test_dir = '/home/berhan/Development/personal/HelmetClassCorrector/test/cnn_test'
-    feature_model_path = 'feature_classifier_xgboost.pkl'
-    cnn_model_path = 'cnn_classifier_best.pth'
+    test_dir = 'test/cnn_test'
+    feature_model_path = 'models/trained/feature_classifier_xgboost.pkl'
+    cnn_model_path = 'models/trained/cnn_classifier_best.pth'
     
     results = test_yolo_simulation(test_dir, feature_model_path, cnn_model_path)
     
