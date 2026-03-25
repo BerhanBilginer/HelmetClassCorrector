@@ -1,3 +1,18 @@
+"""
+⚠️  DEPRECATED — Bu modül artık kullanılmıyor.
+
+Ensemble classifier (Feature + CNN) kaldırıldı. Inference ve eğitimde
+sadece CNN (HelmetClassifierNet) kullanılıyor.
+Bkz: src/models/cnn_classifier.py
+"""
+
+import warnings
+warnings.warn(
+    "ensemble_classifier.py is deprecated. Use cnn_classifier.py instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
 import numpy as np
 from pathlib import Path
 import joblib

@@ -1,3 +1,18 @@
+"""
+⚠️  DEPRECATED — Bu modül artık kullanılmıyor.
+
+Feature-based classifier (XGBoost) kaldırıldı. Inference ve eğitimde
+sadece CNN (HelmetClassifierNet) kullanılıyor.
+Bkz: src/models/cnn_classifier.py
+"""
+
+import warnings
+warnings.warn(
+    "feature_classifier.py is deprecated. Use cnn_classifier.py instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
 import cv2
 import numpy as np
 import pandas as pd

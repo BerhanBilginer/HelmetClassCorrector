@@ -23,9 +23,9 @@ from PIL import Image
 PROJECT_ROOT = Path(__file__).resolve().parent
 YOLOV9_DIR = PROJECT_ROOT / "yolov9"
 YOLO_WEIGHTS = PROJECT_ROOT / "models" / "trained" / "e200_scratch.pt"
-CNN_WEIGHTS = PROJECT_ROOT / "models" / "trained" / "cnn_rgb_based_classifier.pth"
+CNN_WEIGHTS = PROJECT_ROOT / "models" / "trained" / "helmet_classifier_v3.pth"
 INPUT_DIR = PROJECT_ROOT / "test" / "images"
-OUTPUT_DIR = PROJECT_ROOT / "results" / "240326_results"
+OUTPUT_DIR = PROJECT_ROOT / "results" / "250326_results"
 
 # ── PyTorch 2.6+ compat ─────────────────────────────────────────────────────
 _original_torch_load = torch.load
@@ -56,7 +56,7 @@ def get_yolo_model():
     dev = select_device(device)
     model = DetectMultiBackend(str(YOLO_WEIGHTS), device=dev)
     stride = int(model.stride)
-    imgsz = check_img_size(640, s=stride)
+    imgsz = check_img_size(1280, s=stride)
     model.warmup(imgsz=(1, 3, imgsz, imgsz))
     return model, dev, imgsz, stride
 
@@ -116,6 +116,28 @@ def classify_crop(classifier, crop_bgr):
 
 def bgr_to_rgb(img):
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+MIN_BBOX_SIZE = 40  # minimum piksel (genişlik ve yükseklik)
+
+
+def filter_detections(detections, img_shape, min_size=MIN_BBOX_SIZE):
+    """
+    Küçük bbox'ları filtreler — CNN'e göndermeden önce.
+    Çok küçük crop'lar 224×224'e resize edildiğinde blur/artifact yaratır.
+    """
+    h, w = img_shape[:2]
+    filtered = []
+    for det in detections:
+        x1 = max(0, det["x1"])
+        y1 = max(0, det["y1"])
+        x2 = min(w, det["x2"])
+        y2 = min(h, det["y2"])
+        bw = x2 - x1
+        bh = y2 - y1
+        if bw >= min_size and bh >= min_size:
+            filtered.append({**det, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+    return filtered
 
 
 COLORS = {"helmet": (0, 200, 0), "no_helmet": (0, 0, 255)}
@@ -222,48 +244,59 @@ def main():
         st.markdown("---")
         st.header("Adım 3: Kırpılmış Tespitler")
 
+        # Filter small detections
+        detections = filter_detections(detections, img_bgr.shape)
+
         crops = []
         valid_detections = []
         for d in detections:
-            x1, y1 = max(0, d["x1"]), max(0, d["y1"])
-            x2, y2 = min(w, d["x2"]), min(h, d["y2"])
-            if x2 > x1 and y2 > y1:
-                crop = img_bgr[y1:y2, x1:x2]
-                crops.append(crop)
-                valid_detections.append({**d, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+            crop = img_bgr[d["y1"]:d["y2"], d["x1"]:d["x2"]]
+            crops.append(crop)
+            valid_detections.append(d)
 
         cols = st.columns(min(len(crops), 6))
         for i, crop in enumerate(crops):
             with cols[i % len(cols)]:
                 st.image(bgr_to_rgb(crop), caption=f"Det {i+1}", width="stretch")
 
-        # ── STEP 4: CNN Classification ───────────────────────────────────
+        # ── STEP 4: CNN Classification (batch) ──────────────────────────
         st.markdown("---")
         st.header("Adım 4: CNN Sınıflandırma")
 
+        # Batch inference
+        crops_pil = [Image.fromarray(bgr_to_rgb(c)) for c in crops]
+        batch_results = cnn_classifier.predict_batch(crops_pil, return_proba=True)
+        labels_map = {0: "no_helmet", 1: "helmet"}
+
         results = []
         cols = st.columns(min(len(crops), 6))
-        for i, (crop, det) in enumerate(zip(crops, valid_detections)):
-            cnn_result = classify_crop(cnn_classifier, crop)
+        for i, (crop, det, br) in enumerate(zip(crops, valid_detections, batch_results)):
+            label = labels_map[br["prediction"]]
+            confidence = br["confidence"]
+            proba_helmet = br["probabilities"]["helmet"]
+            proba_no_helmet = br["probabilities"]["no_helmet"]
             result = {
                 "x1": det["x1"], "y1": det["y1"], "x2": det["x2"], "y2": det["y2"],
                 "yolo_conf": det["conf"],
                 "yolo_cls": det["yolo_cls"],
-                **cnn_result
+                "label": label,
+                "confidence": confidence,
+                "proba_helmet": proba_helmet,
+                "proba_no_helmet": proba_no_helmet,
             }
             results.append(result)
 
             with cols[i % len(cols)]:
-                emoji = "✅" if cnn_result["label"] == "helmet" else "❌"
-                color = "green" if cnn_result["label"] == "helmet" else "red"
+                emoji = "✅" if label == "helmet" else "❌"
+                color = "green" if label == "helmet" else "red"
                 st.image(bgr_to_rgb(crop), width="stretch")
                 st.markdown(
-                    f'{emoji} **:{color}[{cnn_result["label"]}]** '
-                    f'({cnn_result["confidence"]:.0%})'
+                    f'{emoji} **:{color}[{label}]** '
+                    f'({confidence:.0%})'
                 )
                 st.caption(
-                    f'Helmet: {cnn_result["proba_helmet"]:.1%} | '
-                    f'No helmet: {cnn_result["proba_no_helmet"]:.1%}'
+                    f'Helmet: {proba_helmet:.1%} | '
+                    f'No helmet: {proba_no_helmet:.1%}'
                 )
 
         # ── STEP 5: Final Result ─────────────────────────────────────────
@@ -323,15 +356,25 @@ def main():
             h, w = img_bgr.shape[:2]
             detections = yolo_detect(yolo_model, img_bgr, dev, imgsz, stride, conf_thres, iou_thres)
 
+            detections = filter_detections(detections, img_bgr.shape)
+
+            # Batch CNN inference
+            crops_pil = [
+                Image.fromarray(bgr_to_rgb(img_bgr[d["y1"]:d["y2"], d["x1"]:d["x2"]]))
+                for d in detections
+            ]
             results = []
-            for d in detections:
-                x1, y1 = max(0, d["x1"]), max(0, d["y1"])
-                x2, y2 = min(w, d["x2"]), min(h, d["y2"])
-                if x2 <= x1 or y2 <= y1:
-                    continue
-                crop = img_bgr[y1:y2, x1:x2]
-                cnn_result = classify_crop(cnn_classifier, crop)
-                results.append({**d, "x1": x1, "y1": y1, "x2": x2, "y2": y2, **cnn_result})
+            if crops_pil:
+                batch_res = cnn_classifier.predict_batch(crops_pil, return_proba=True)
+                lmap = {0: "no_helmet", 1: "helmet"}
+                for d, br in zip(detections, batch_res):
+                    results.append({
+                        **d,
+                        "label": lmap[br["prediction"]],
+                        "confidence": br["confidence"],
+                        "proba_helmet": br["probabilities"]["helmet"],
+                        "proba_no_helmet": br["probabilities"]["no_helmet"],
+                    })
 
             final_img = draw_final(img_bgr, results)
             cv2.imwrite(str(OUTPUT_DIR / img_path.name), final_img)
