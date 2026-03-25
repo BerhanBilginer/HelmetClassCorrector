@@ -1,5 +1,4 @@
 import cv2
-import os
 from pathlib import Path
 from tqdm import tqdm
 
@@ -39,7 +38,26 @@ def yolo_to_bbox(x_center, y_center, width, height, img_width, img_height):
 
 def crop_objects_from_dataset(dataset_path, output_base_path, class_mapping={1: 'helmet', 3: 'no_helmet'}):
     """
-    YOLO dataset'inden objeleri crop eder ve sınıflarına göre klasörlere kaydeder.
+    YOLO dataset'inden objeleri crop eder.
+
+    Beklenen giriş yapısı:
+      dataset/
+        train/
+          images/
+          labels/
+        val/
+          images/
+          labels/
+        test/
+          images/
+          labels/
+
+    Her görsel için aynı ada sahip label dosyası labels klasöründe aranır.
+    Crop çıktıları split bazlı ve sınıfa göre kaydedilir:
+      output_base_path/
+        train/helmet, train/no_helmet
+        val/helmet,   val/no_helmet
+        test/helmet,  test/no_helmet
     
     Args:
         dataset_path: YOLO dataset ana klasörü (train, val, test içeren)
@@ -49,21 +67,27 @@ def crop_objects_from_dataset(dataset_path, output_base_path, class_mapping={1: 
     dataset_path = Path(dataset_path)
     output_base_path = Path(output_base_path)
     
-    output_dirs = {}
-    counters = {}
-    
-    for class_id, folder_name in class_mapping.items():
-        output_dir = output_base_path / folder_name
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_dirs[class_id] = output_dir
-        counters[class_id] = get_next_number(output_dir)
-    
-    print(f"📁 Başlangıç numaraları:")
-    for class_id, folder_name in class_mapping.items():
-        print(f"  • Class {class_id} ({folder_name}): {counters[class_id]}")
-    
     splits = ['train', 'val', 'test']
-    total_crops = {class_id: 0 for class_id in class_mapping.keys()}
+    output_dirs = {split: {} for split in splits}
+    counters = {split: {} for split in splits}
+
+    for split in splits:
+        for class_id, folder_name in class_mapping.items():
+            output_dir = output_base_path / split / folder_name
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_dirs[split][class_id] = output_dir
+            counters[split][class_id] = get_next_number(output_dir)
+
+    print("📁 Başlangıç numaraları:")
+    for split in splits:
+        print(f"  [{split}]")
+        for class_id, folder_name in class_mapping.items():
+            print(f"    • Class {class_id} ({folder_name}): {counters[split][class_id]}")
+
+    total_crops = {
+        split: {class_id: 0 for class_id in class_mapping.keys()}
+        for split in splits
+    }
     total_images_processed = 0
     total_images_with_crops = 0
     skipped_images = 0
@@ -76,30 +100,23 @@ def crop_objects_from_dataset(dataset_path, output_base_path, class_mapping={1: 
             print(f"⚠️  {split} klasörü bulunamadı, atlanıyor...")
             continue
         
-        label_files = list(labels_dir.glob('*.txt'))
-        
-        if not label_files:
-            print(f"⚠️  {split}/labels klasöründe txt dosyası bulunamadı")
+        image_files = []
+        for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp']:
+            image_files.extend(images_dir.glob(ext))
+
+        if not image_files:
+            print(f"⚠️  {split}/images klasöründe görsel bulunamadı")
             continue
         
         print(f"\n{'='*60}")
         print(f"📁 {split.upper()} klasörü işleniyor...")
         print(f"{'='*60}")
         
-        for label_file in tqdm(label_files, desc=f"Processing {split}"):
+        for image_path in tqdm(sorted(image_files), desc=f"Processing {split}"):
             total_images_processed += 1
-            
-            image_name = label_file.stem
-            
-            image_extensions = ['.jpg', '.jpeg', '.png', '.bmp']
-            image_path = None
-            for ext in image_extensions:
-                potential_path = images_dir / f"{image_name}{ext}"
-                if potential_path.exists():
-                    image_path = potential_path
-                    break
-            
-            if image_path is None:
+
+            label_file = labels_dir / f"{image_path.stem}.txt"
+            if not label_file.exists():
                 skipped_images += 1
                 continue
             
@@ -153,14 +170,14 @@ def crop_objects_from_dataset(dataset_path, output_base_path, class_mapping={1: 
                     if cropped_img.size == 0:
                         continue
                     
-                    output_dir = output_dirs[class_id]
-                    output_filename = f"{counters[class_id]}.png"
+                    output_dir = output_dirs[split][class_id]
+                    output_filename = f"{counters[split][class_id]}.png"
                     output_path = output_dir / output_filename
                     
                     cv2.imwrite(str(output_path), cropped_img)
                     
-                    counters[class_id] += 1
-                    total_crops[class_id] += 1
+                    counters[split][class_id] += 1
+                    total_crops[split][class_id] += 1
                     has_crops = True
                 
                 except (ValueError, IndexError) as e:
@@ -177,12 +194,19 @@ def crop_objects_from_dataset(dataset_path, output_base_path, class_mapping={1: 
     print(f"  • Crop içeren görüntü: {total_images_with_crops}")
     print(f"  • Atlanan görüntü: {skipped_images}")
     print(f"\n✂️  CROP EDİLEN OBJELER:")
-    for class_id, folder_name in class_mapping.items():
-        print(f"  • Class {class_id} ({folder_name}): {total_crops[class_id]} adet")
-    print(f"  • Toplam: {sum(total_crops.values())} adet")
+    grand_total = 0
+    for split in splits:
+        split_total = sum(total_crops[split].values())
+        grand_total += split_total
+        print(f"  [{split}] toplam: {split_total} adet")
+        for class_id, folder_name in class_mapping.items():
+            print(f"    • Class {class_id} ({folder_name}): {total_crops[split][class_id]} adet")
+    print(f"  • Genel toplam: {grand_total} adet")
     print(f"\n📁 SON NUMARALAR:")
-    for class_id, folder_name in class_mapping.items():
-        print(f"  • Class {class_id} ({folder_name}): {counters[class_id] - 1}")
+    for split in splits:
+        print(f"  [{split}]")
+        for class_id, folder_name in class_mapping.items():
+            print(f"    • Class {class_id} ({folder_name}): {counters[split][class_id] - 1}")
     print(f"{'='*60}\n")
     
     return total_crops
@@ -199,8 +223,8 @@ if __name__ == "__main__":
     print(f"\nDataset: {dataset_path}")
     print(f"Output: {output_path}")
     print(f"\nClass Mapping:")
-    print(f"  • Class 1 → {output_path}/helmet")
-    print(f"  • Class 3 → {output_path}/no_helmet")
+    print(f"  • Class 1 → <output>/<split>/helmet")
+    print(f"  • Class 3 → <output>/<split>/no_helmet")
     print("=" * 60)
     
     response = input("\nDevam etmek istiyor musunuz? (y/n): ").lower()
