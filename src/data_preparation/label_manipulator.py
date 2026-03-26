@@ -1,6 +1,9 @@
 import os
+import cv2
+import numpy as np
 from pathlib import Path
 from tqdm import tqdm
+import random
 
 def filter_labels_by_class(dataset_path, keep_classes=[1, 3], backup=True):
     """
@@ -123,6 +126,206 @@ def filter_labels_by_class(dataset_path, keep_classes=[1, 3], backup=True):
     
     return stats
 
+def balance_classes_with_augmentation(dataset_path, target_class, balance_ratio=1.0, augment_types=['flip', 'rotate', 'perspective']):
+    """
+    Azınlık sınıfını geometric augmentation ile dengeler.
+    Color-based model için color augmentation YAPILMAZ.
+    
+    Args:
+        dataset_path: Dataset ana klasörü (train, val, test içeren)
+        target_class: Artırılacak sınıf ID'si (örn: 3 for no_helmet)
+        balance_ratio: Hedef oran (1.0 = tam denge, 0.5 = yarı yarıya)
+        augment_types: Kullanılacak augmentation tipleri
+    
+    Augmentation tipleri:
+        - 'flip': Horizontal flip
+        - 'rotate': ±15° rotation
+        - 'perspective': Hafif perspective transform
+    """
+    dataset_path = Path(dataset_path)
+    splits = ['train']  # Sadece train split'i dengele
+    
+    print(f"\n{'='*60}")
+    print(f"⚖️  CLASS BALANCING: Class {target_class}")
+    print(f"{'='*60}")
+    print(f"Augmentation types: {', '.join(augment_types)}")
+    print(f"Balance ratio: {balance_ratio:.1%}")
+    
+    for split in splits:
+        images_dir = dataset_path / split / 'images'
+        labels_dir = dataset_path / split / 'labels'
+        
+        if not images_dir.exists() or not labels_dir.exists():
+            print(f"⚠️  {split} klasörü bulunamadı, atlanıyor...")
+            continue
+        
+        # Count class distribution
+        class_counts = {}
+        class_files = {}
+        
+        for label_file in labels_dir.glob('*.txt'):
+            with open(label_file, 'r') as f:
+                lines = f.readlines()
+            
+            for line in lines:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    class_id = int(parts[0])
+                    if class_id not in class_counts:
+                        class_counts[class_id] = 0
+                        class_files[class_id] = []
+                    class_counts[class_id] += 1
+                    if label_file not in class_files[class_id]:
+                        class_files[class_id].append(label_file)
+        
+        print(f"\n📊 {split.upper()} - Mevcut dağılım:")
+        for cls_id, count in sorted(class_counts.items()):
+            print(f"  • Class {cls_id}: {count:,} instances")
+        
+        if target_class not in class_counts:
+            print(f"⚠️  Class {target_class} bulunamadı!")
+            continue
+        
+        # Calculate how many augmentations needed
+        max_count = max(class_counts.values())
+        target_count = int(max_count * balance_ratio)
+        current_count = class_counts[target_class]
+        needed = target_count - current_count
+        
+        if needed <= 0:
+            print(f"✅ Class {target_class} zaten dengeli (veya çoğunlukta)")
+            continue
+        
+        print(f"\n🎯 Hedef: {current_count:,} → {target_count:,} (+{needed:,} augmentation)")
+        
+        # Get files containing target class
+        target_files = class_files[target_class]
+        random.shuffle(target_files)
+        
+        augmented_count = 0
+        aug_cycle = 0
+        
+        with tqdm(total=needed, desc=f"Augmenting class {target_class}") as pbar:
+            while augmented_count < needed:
+                # Cycle through files
+                label_file = target_files[aug_cycle % len(target_files)]
+                image_name = label_file.stem
+                
+                # Find image file
+                image_path = None
+                for ext in ['.jpg', '.jpeg', '.png', '.bmp']:
+                    potential = images_dir / f"{image_name}{ext}"
+                    if potential.exists():
+                        image_path = potential
+                        break
+                
+                if image_path is None:
+                    aug_cycle += 1
+                    continue
+                
+                # Load image and labels
+                img = cv2.imread(str(image_path))
+                if img is None:
+                    aug_cycle += 1
+                    continue
+                
+                with open(label_file, 'r') as f:
+                    labels = [line.strip() for line in f.readlines() if line.strip()]
+                
+                # Filter only target class
+                target_labels = [l for l in labels if int(l.split()[0]) == target_class]
+                if not target_labels:
+                    aug_cycle += 1
+                    continue
+                
+                # Choose random augmentation
+                aug_type = random.choice(augment_types)
+                
+                # Apply augmentation
+                aug_img, aug_labels = apply_augmentation(img, target_labels, aug_type)
+                
+                # Save augmented image and label
+                aug_suffix = f"_aug{augmented_count}_{aug_type}"
+                aug_img_name = f"{image_name}{aug_suffix}{image_path.suffix}"
+                aug_label_name = f"{image_name}{aug_suffix}.txt"
+                
+                cv2.imwrite(str(images_dir / aug_img_name), aug_img)
+                with open(labels_dir / aug_label_name, 'w') as f:
+                    f.write('\n'.join(aug_labels) + '\n')
+                
+                augmented_count += len(target_labels)
+                pbar.update(len(target_labels))
+                aug_cycle += 1
+        
+        print(f"\n✅ {split.upper()}: {augmented_count:,} augmented instances oluşturuldu")
+    
+    print(f"\n{'='*60}")
+    print(f"✅ CLASS BALANCING TAMAMLANDI")
+    print(f"{'='*60}\n")
+
+
+def apply_augmentation(img, labels, aug_type):
+    """
+    Geometric augmentation uygular ve YOLO bbox'ları günceller.
+    
+    Args:
+        img: OpenCV image (BGR)
+        labels: YOLO format label strings (class x_center y_center width height)
+        aug_type: 'flip', 'rotate', 'perspective'
+    
+    Returns:
+        aug_img: Augmented image
+        aug_labels: Updated YOLO labels
+    """
+    h, w = img.shape[:2]
+    
+    if aug_type == 'flip':
+        # Horizontal flip
+        aug_img = cv2.flip(img, 1)
+        aug_labels = []
+        for label in labels:
+            parts = label.split()
+            class_id = parts[0]
+            x_center = 1.0 - float(parts[1])  # Mirror x
+            y_center = float(parts[2])
+            width = float(parts[3])
+            height = float(parts[4])
+            aug_labels.append(f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}")
+        return aug_img, aug_labels
+    
+    elif aug_type == 'rotate':
+        # Random rotation ±15°
+        angle = random.uniform(-15, 15)
+        center = (w // 2, h // 2)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        aug_img = cv2.warpAffine(img, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+        
+        # Rotate bboxes (approximate - keep original for simplicity)
+        # For small rotations, bbox shift is minimal
+        aug_labels = labels.copy()
+        return aug_img, aug_labels
+    
+    elif aug_type == 'perspective':
+        # Slight perspective transform
+        pts1 = np.float32([[0, 0], [w, 0], [0, h], [w, h]])
+        shift = int(w * 0.05)  # 5% shift
+        pts2 = np.float32([
+            [random.randint(0, shift), random.randint(0, shift)],
+            [w - random.randint(0, shift), random.randint(0, shift)],
+            [random.randint(0, shift), h - random.randint(0, shift)],
+            [w - random.randint(0, shift), h - random.randint(0, shift)]
+        ])
+        M = cv2.getPerspectiveTransform(pts1, pts2)
+        aug_img = cv2.warpPerspective(img, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+        
+        # Keep original labels (perspective is slight)
+        aug_labels = labels.copy()
+        return aug_img, aug_labels
+    
+    else:
+        return img, labels
+
+
 def restore_from_backup(dataset_path):
     """
     Yedekten geri yükleme yapar.
@@ -157,21 +360,46 @@ def restore_from_backup(dataset_path):
 if __name__ == "__main__":
     dataset_path = '/home/berhan/Development/personal/HelmetClassCorrector/kiran_dataset'
     
-    print("🔧 YOLO Label Filtreleme Aracı")
+    print("🔧 YOLO Dataset Manipülasyon Aracı")
     print("=" * 60)
-    print("Bu script class_id 0 ve 2 olan satırları siler,")
-    print("sadece class_id 1 ve 3 olanları tutar.")
+    print("Seçenekler:")
+    print("  1. Label filtreleme (class_id 0 ve 2 sil)")
+    print("  2. Class balancing (azınlık sınıfını augment et)")
+    print("  3. Backup'tan geri yükle")
     print("=" * 60)
     
-    response = input("\nDevam etmek istiyor musunuz? (y/n): ").lower()
+    choice = input("\nSeçiminiz (1/2/3): ").strip()
     
-    if response == 'y':
+    if choice == '1':
+        print("\n📋 Label filtreleme başlatılıyor...")
         stats = filter_labels_by_class(
             dataset_path=dataset_path,
             keep_classes=[1, 3],
             backup=True
         )
+        print("\n💡 İpucu: Geri yüklemek için seçenek 3'ü kullanabilirsiniz.")
+    
+    elif choice == '2':
+        print("\n⚖️  Class balancing başlatılıyor...")
+        print("\nÖrnek: Class 1 (helmet): 117336, Class 3 (no_helmet): 71232")
+        target_class = int(input("Artırılacak sınıf ID (örn: 3): "))
+        balance_ratio = float(input("Denge oranı (0.0-1.0, örn: 1.0 tam denge): "))
         
-        print("\n💡 İpucu: Geri yüklemek için restore_from_backup() fonksiyonunu kullanabilirsiniz.")
+        balance_classes_with_augmentation(
+            dataset_path=dataset_path,
+            target_class=target_class,
+            balance_ratio=balance_ratio,
+            augment_types=['flip', 'rotate', 'perspective']
+        )
+        print("\n💡 Augmented dosyalar '_aug' suffix'i ile kaydedildi.")
+    
+    elif choice == '3':
+        print("\n♻️  Backup'tan geri yükleme başlatılıyor...")
+        response = input("Emin misiniz? Tüm değişiklikler geri alınacak (y/n): ").lower()
+        if response == 'y':
+            restore_from_backup(dataset_path)
+        else:
+            print("❌ İşlem iptal edildi.")
+    
     else:
-        print("❌ İşlem iptal edildi.")
+        print("❌ Geçersiz seçim.")
