@@ -1,3 +1,19 @@
+"""
+HelmetClassifierNet v5 — Upgraded CNN Classifier
+
+Değişiklikler (v4 → v5):
+  ✦ Focal Loss + Label Smoothing → overconfidence azaltma
+  ✦ Mixup / CutMix augmentation → decision boundary düzleştirme
+  ✦ EdgeTextureBranch → renk yerine yüzey dokusu/kenar bilgisi
+  ✦ 384×384 input desteği → ince detayları yakalama
+  ✦ Test-Time Augmentation (TTA) → inference robustness
+  ✦ Grad-CAM hook desteği → model debugging
+
+Mimari:
+  EfficientNet-B0 backbone + CBAM + FPN + EdgeTexture Branch
+  (128 FPN + 64 edge) = 192 → 128 → 64 → 2
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,53 +30,151 @@ import seaborn as sns
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 from tqdm import tqdm
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOSS FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss — zor örneklere daha fazla ağırlık verir.
+
+    Kolay örneklerin (model zaten %99 doğru biliyor) gradient'ini bastırır,
+    borderline vakalara (koyu kask ↔ koyu saç) odaklanmayı zorlar.
+
+    Args:
+        alpha:  Class balance ağırlığı (0-1). 0.25 = minority class boost.
+        gamma:  Focusing parametresi (0-5). Yüksek → zor örneklere daha çok odak.
+                gamma=0 → standart CE, gamma=2 → iyi başlangıç.
+        label_smoothing: Soft target parametresi (0-0.2). Overconfidence azaltır.
+    """
+    def __init__(self, alpha=0.25, gamma=2.0, label_smoothing=0.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(
+            inputs, targets,
+            reduction='none',
+            label_smoothing=self.label_smoothing
+        )
+        pt = torch.exp(-ce_loss)
+        focal_weight = self.alpha * (1 - pt) ** self.gamma
+        return (focal_weight * ce_loss).mean()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MIXUP / CUTMIX AUGMENTATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def mixup_data(x, y, alpha=0.4):
+    """
+    Mixup: İki görüntüyü lambda oranında karıştırır.
+    Decision boundary'yi düzleştirir, overconfidence azaltır.
+
+    Returns:
+        mixed_x:  Karışık görüntü batch'i
+        y_a, y_b: Orijinal label'lar
+        lam:      Karışım oranı
+    """
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1.0
+
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size, device=x.device)
+
+    mixed_x = lam * x + (1 - lam) * x[index]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
+def cutmix_data(x, y, alpha=1.0):
+    """
+    CutMix: Bir görüntünün bir bölgesini başka bir görüntüyle değiştirir.
+    Mixup'tan daha agresif — model yerel özelliklere odaklanmaya zorlanır.
+
+    Returns:
+        mixed_x:  CutMix uygulanmış batch
+        y_a, y_b: Orijinal label'lar
+        lam:      Orijinal alan oranı (kesilen alan sonrası)
+    """
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1.0
+
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size, device=x.device)
+
+    _, _, H, W = x.shape
+    cut_ratio = np.sqrt(1.0 - lam)
+    cut_w = int(W * cut_ratio)
+    cut_h = int(H * cut_ratio)
+
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+
+    x1 = np.clip(cx - cut_w // 2, 0, W)
+    y1 = np.clip(cy - cut_h // 2, 0, H)
+    x2 = np.clip(cx + cut_w // 2, 0, W)
+    y2 = np.clip(cy + cut_h // 2, 0, H)
+
+    mixed_x = x.clone()
+    mixed_x[:, :, y1:y2, x1:x2] = x[index, :, y1:y2, x1:x2]
+
+    # Gerçek lambda'yı hesapla (clip sonrası alan değişebilir)
+    lam = 1 - ((x2 - x1) * (y2 - y1) / (W * H))
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """Mixup / CutMix için weighted loss hesaplama."""
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DATASET
+# ═══════════════════════════════════════════════════════════════════════════════
+
 class HelmetDataset(Dataset):
-    """
-    Helmet/No-Helmet dataset için PyTorch Dataset.
-    """
+    """Helmet/No-Helmet dataset için PyTorch Dataset."""
     def __init__(self, data_dir, split='train', transform=None):
-        """
-        Args:
-            data_dir: Dataset ana klasörü
-            split: 'train', 'val', veya 'test'
-            transform: Torchvision transforms
-        """
         self.data_dir = Path(data_dir) / split
         self.transform = transform
         self.samples = []
         self.labels = []
-        
+
         helmet_dir = self.data_dir / 'helmet'
         no_helmet_dir = self.data_dir / 'no_helmet'
-        
-        for img_path in helmet_dir.glob('*.png'):
-            self.samples.append(img_path)
-            self.labels.append(1)
-        for img_path in helmet_dir.glob('*.jpg'):
-            self.samples.append(img_path)
-            self.labels.append(1)
-        
-        for img_path in no_helmet_dir.glob('*.png'):
-            self.samples.append(img_path)
-            self.labels.append(0)
-        for img_path in no_helmet_dir.glob('*.jpg'):
-            self.samples.append(img_path)
-            self.labels.append(0)
-    
+
+        for ext in ['*.png', '*.jpg']:
+            for img_path in helmet_dir.glob(ext):
+                self.samples.append(img_path)
+                self.labels.append(1)
+            for img_path in no_helmet_dir.glob(ext):
+                self.samples.append(img_path)
+                self.labels.append(0)
+
     def __len__(self):
         return len(self.samples)
-    
+
     def __getitem__(self, idx):
         img_path = self.samples[idx]
         label = self.labels[idx]
-        
         image = Image.open(img_path).convert('RGB')
-        
         if self.transform:
             image = self.transform(image)
-        
         return image, label
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ATTENTION MODULES
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class ChannelAttention(nn.Module):
     """CBAM Channel Attention — hangi feature map'ler önemli."""
@@ -108,119 +222,169 @@ class CBAM(nn.Module):
         return x
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# DEFORMABLE CONVOLUTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
 class DeformableConv2d(nn.Module):
-    """
-    Deformable Convolution v2 — öğrenilebilir offset ile geometrik dönüşümlere
-    uyum sağlar. Smooth katmanları yerine kullanılır.
-    """
+    """Deformable Convolution v2 — geometrik dönüşümlere uyum."""
     def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, bias=False):
         super().__init__()
         self.kernel_size = kernel_size
         self.padding = padding
-        
-        # Offset: 2 * kernel_size^2 (x,y per kernel position)
+
         self.offset_conv = nn.Conv2d(
             in_channels, 2 * kernel_size * kernel_size,
             kernel_size=kernel_size, padding=padding, bias=True
         )
         nn.init.zeros_(self.offset_conv.weight)
         nn.init.zeros_(self.offset_conv.bias)
-        
-        # Modulation mask: kernel_size^2
+
         self.mask_conv = nn.Conv2d(
             in_channels, kernel_size * kernel_size,
             kernel_size=kernel_size, padding=padding, bias=True
         )
         nn.init.zeros_(self.mask_conv.weight)
         nn.init.constant_(self.mask_conv.bias, 0.5)
-        
-        # Actual conv weight
+
         self.weight = nn.Parameter(
             torch.empty(out_channels, in_channels, kernel_size, kernel_size)
         )
         nn.init.kaiming_uniform_(self.weight)
-        
         self.bias = nn.Parameter(torch.zeros(out_channels)) if bias else None
-    
+
     def forward(self, x):
         offset = self.offset_conv(x)
         mask = torch.sigmoid(self.mask_conv(x))
-        return deform_conv2d(
-            x, offset, self.weight,
-            bias=self.bias,
-            padding=self.padding,
-            mask=mask
-        )
+        return deform_conv2d(x, offset, self.weight, bias=self.bias,
+                             padding=self.padding, mask=mask)
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADAPTIVE FEATURE POOLING
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class AdaptiveFeaturePooling(nn.Module):
-    """
-    Adaptive Feature Pooling — her FPN ölçeğine öğrenilebilir ağırlık verir.
-    
-    Model her görüntü için hangi ölçeğin (p3, p4, p5) daha önemli olduğunu
-    dinamik olarak öğrenir. Attention-based weighted fusion.
-    """
+    """FPN ölçeklerine attention-based weighted fusion."""
     def __init__(self, feature_dim=128, num_scales=3):
         super().__init__()
         self.num_scales = num_scales
-        
-        # Attention network: tüm ölçekleri birleştirip her birine ağırlık hesaplar
         self.attention = nn.Sequential(
             nn.Linear(feature_dim * num_scales, feature_dim),
             nn.ReLU(inplace=True),
             nn.Linear(feature_dim, num_scales),
             nn.Softmax(dim=1)
         )
-    
-    def forward(self, features):
-        """
-        Args:
-            features: List of [p3_pool, p4_pool, p5_pool] — her biri (B, 128)
-        Returns:
-            weighted_feat: (B, 128) — ağırlıklı toplam
-        """
-        # Stack all features: (B, num_scales, feature_dim)
-        stacked = torch.stack(features, dim=1)  # (B, 3, 128)
-        
-        # Concat for attention: (B, num_scales * feature_dim)
-        concat = stacked.view(stacked.size(0), -1)  # (B, 384)
-        
-        # Compute attention weights: (B, num_scales)
-        weights = self.attention(concat)  # (B, 3)
-        
-        # Weighted sum: (B, feature_dim)
-        weights = weights.unsqueeze(2)  # (B, 3, 1)
-        weighted_feat = (stacked * weights).sum(dim=1)  # (B, 128)
-        
-        return weighted_feat
 
+    def forward(self, features):
+        stacked = torch.stack(features, dim=1)
+        concat = stacked.view(stacked.size(0), -1)
+        weights = self.attention(concat).unsqueeze(2)
+        return (stacked * weights).sum(dim=1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EDGE TEXTURE BRANCH  (v5 — replaces color_branch)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class EdgeTextureBranch(nn.Module):
+    """
+    Renk yerine yüzey dokusu & kenar bilgisi çıkarır.
+
+    Sorun: color_branch raw RGB'den öğreniyor → koyu kask ≈ koyu saç.
+    Çözüm: Sabit Sobel filtresi ile kenar haritası çıkar,
+           grayscale + edge_x + edge_y → 3 kanallı yapısal girdi.
+           Bu sayede model renk yerine doku ve kenar farkını öğrenir.
+           (Kask: pürüzsüz yüzey, keskin kenarlar / Saç: dokulu, dağınık kenarlar)
+
+    Input:  (B, 3, H, W) RGB tensor (normalleştirilmiş)
+    Output: (B, 64) edge-texture feature vector
+    """
+    def __init__(self, out_dim=64):
+        super().__init__()
+
+        # Sabit Sobel kernelleri (öğrenilmez, register_buffer ile)
+        sobel_x = torch.tensor(
+            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32
+        ).view(1, 1, 3, 3)
+        sobel_y = torch.tensor(
+            [[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32
+        ).view(1, 1, 3, 3)
+        self.register_buffer('sobel_x', sobel_x)
+        self.register_buffer('sobel_y', sobel_y)
+
+        # ImageNet normalizasyonunu geri almak için parametreler
+        self.register_buffer('denorm_mean',
+                             torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('denorm_std',
+                             torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+        # 3 kanal girdi: grayscale + edge_x + edge_y
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.AvgPool2d(2),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.AvgPool2d(2),
+            nn.Conv2d(32, out_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_dim),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+        )
+
+    def forward(self, x):
+        # Denormalize → gerçek piksel değerleri (0-1)
+        x_raw = x * self.denorm_std + self.denorm_mean
+
+        # RGB → Grayscale
+        gray = 0.299 * x_raw[:, 0:1] + 0.587 * x_raw[:, 1:2] + 0.114 * x_raw[:, 2:3]
+
+        # Sobel kenar haritaları
+        edge_x = F.conv2d(gray, self.sobel_x, padding=1)
+        edge_y = F.conv2d(gray, self.sobel_y, padding=1)
+
+        # [grayscale, edge_x, edge_y] → yapısal 3-kanal girdi
+        structural = torch.cat([gray, edge_x, edge_y], dim=1)
+
+        return self.features(structural).view(x.size(0), -1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MODEL
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class HelmetClassifierNet(nn.Module):
     """
-    Production-grade helmet classifier.
+    HelmetClassifierNet v5.
 
-    EfficientNet-B0 backbone (pretrained ImageNet) + CBAM + FPN + Color Branch.
+    EfficientNet-B0 backbone + CBAM + FPN + EdgeTexture Branch.
+
+    Değişiklikler (v4 → v5):
+      - color_branch → EdgeTextureBranch (kenar + doku, renk bağımsız)
+      - branch_type parametresi: 'edge_texture' (yeni default) veya 'color' (legacy)
+      - Grad-CAM hook noktası: self.fpn_output (register ile)
 
     Mimari:
-      - Backbone: EfficientNet-B0 features, 3 ölçek çıkarma (40ch, 112ch, 1280ch)
-      - Attention: Her ölçekte CBAM (Channel + Spatial)
-      - FPN: Top-down lateral bağlantılar, tüm ölçekler 128-dim'e projekte
-      - Color Branch: Öğrenilen renk uzayı dönüşümü (1x1 conv) → 64-dim
-      - Classifier: (128 + 64) = 192 → 128 → 64 → 2
+      Backbone:    EfficientNet-B0 features, 3 ölçek (40ch, 112ch, 1280ch)
+      Attention:   Her ölçekte CBAM
+      FPN:         Top-down lateral, tüm ölçekler 128-dim
+      Side Branch: EdgeTexture (grayscale + Sobel → 64-dim)
+      Classifier:  (128 + 64) = 192 → 128 → 64 → 2
 
-    Giriş: 224x224 RGB
-    ~5.9M parametre (5.3M backbone, ~600K trainable head)
-    2-fazlı eğitim: Phase 1 backbone frozen, Phase 2 full fine-tune
+    Giriş: 224×224 veya 384×384 RGB
     """
-    def __init__(self, num_classes=2, pretrained=True):
+    def __init__(self, num_classes=2, pretrained=True, branch_type='edge_texture'):
         super().__init__()
+        self.branch_type = branch_type
 
         weights = EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
         backbone = efficientnet_b0(weights=weights)
 
-        self.stage1 = backbone.features[:4]   # → 40ch,  28x28  (texture)
-        self.stage2 = backbone.features[4:6]  # → 112ch, 14x14  (mid semantics)
-        self.stage3 = backbone.features[6:]   # → 1280ch, 7x7   (high semantics)
+        self.stage1 = backbone.features[:4]   # → 40ch
+        self.stage2 = backbone.features[4:6]  # → 112ch
+        self.stage3 = backbone.features[6:]   # → 1280ch
 
         self.cbam1 = CBAM(40, reduction=8)
         self.cbam2 = CBAM(112, reduction=16)
@@ -229,93 +393,139 @@ class HelmetClassifierNet(nn.Module):
         self.lateral3 = nn.Conv2d(1280, 128, kernel_size=1, bias=False)
         self.lateral2 = nn.Conv2d(112, 128, kernel_size=1, bias=False)
         self.lateral1 = nn.Conv2d(40, 128, kernel_size=1, bias=False)
-        
-        # Deformable Conv replaces standard smooth layers
+
         self.smooth2 = DeformableConv2d(128, 128, kernel_size=3, padding=1)
         self.smooth1 = DeformableConv2d(128, 128, kernel_size=3, padding=1)
-        
-        # Post-FPN CBAM — refine FPN outputs before pooling
+
         self.fpn_cbam3 = CBAM(128, reduction=8)
         self.fpn_cbam2 = CBAM(128, reduction=8)
         self.fpn_cbam1 = CBAM(128, reduction=8)
 
-        self.color_branch = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.AvgPool2d(2),                                    # 224→112 early downsampling
-            nn.Conv2d(16, 32, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.AvgPool2d(2),                                    # 112→56 (was AvgPool2d(4))
-            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d(1),                            # 56→1
-        )
-        
-        # Adaptive Feature Pooling for FPN fusion
+        # Side branch: edge_texture (v5) veya color (v4 legacy)
+        if branch_type == 'edge_texture':
+            self.side_branch = EdgeTextureBranch(out_dim=64)
+        else:
+            # Legacy color branch (v4 uyumluluğu)
+            self.side_branch = nn.Sequential(
+                nn.Conv2d(3, 16, kernel_size=1),
+                nn.ReLU(inplace=True),
+                nn.AvgPool2d(2),
+                nn.Conv2d(16, 32, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+                nn.AvgPool2d(2),
+                nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool2d(1),
+            )
+
         self.adaptive_pooling = AdaptiveFeaturePooling(feature_dim=128, num_scales=3)
 
         self.classifier = nn.Sequential(
             nn.Linear(128 + 64, 128),
             nn.BatchNorm1d(128),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.3),      # was 0.4
+            nn.Dropout(0.3),
             nn.Linear(128, 64),
             nn.BatchNorm1d(64),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.2),      # was 0.3
+            nn.Dropout(0.2),
             nn.Linear(64, num_classes)
         )
 
+        # ── Grad-CAM hook noktası ────────────────────────────────────────
+        self._gradcam_activations = None
+        self._gradcam_gradients = None
+
+    def _save_activation(self, module, input, output):
+        self._gradcam_activations = output
+
+    def _save_gradient(self, module, grad_input, grad_output):
+        self._gradcam_gradients = grad_output[0]
+
+    def register_gradcam_hooks(self, target_layer=None):
+        """
+        Grad-CAM hook'larını kaydeder.
+        Args:
+            target_layer: Hook uygulanacak katman. None ise fpn_cbam3 kullanılır.
+        Returns:
+            hooks: Temizlemek için hook handle listesi.
+        """
+        if target_layer is None:
+            target_layer = self.fpn_cbam3
+
+        h1 = target_layer.register_forward_hook(self._save_activation)
+        h2 = target_layer.register_full_backward_hook(self._save_gradient)
+        return [h1, h2]
+
     def freeze_backbone(self):
-        """Backbone parametrelerini dondurur (transfer learning Phase 1)."""
         for stage in [self.stage1, self.stage2, self.stage3]:
             for param in stage.parameters():
                 param.requires_grad = False
 
     def unfreeze_backbone(self):
-        """Backbone parametrelerini açar (transfer learning Phase 2)."""
         for stage in [self.stage1, self.stage2, self.stage3]:
             for param in stage.parameters():
                 param.requires_grad = True
 
     def forward(self, x):
-        color_feat = self.color_branch(x).view(x.size(0), -1)
+        # Side branch (edge-texture veya color)
+        if self.branch_type == 'edge_texture':
+            side_feat = self.side_branch(x)
+        else:
+            side_feat = self.side_branch(x).view(x.size(0), -1)
 
-        c3 = self.stage1(x)
-        c4 = self.stage2(c3)
-        c5 = self.stage3(c4)
+        # Backbone + CBAM
+        c3 = self.cbam1(self.stage1(x))
+        c4 = self.cbam2(self.stage2(c3))
+        c5 = self.cbam3(self.stage3(c4))
 
-        c3 = self.cbam1(c3)
-        c4 = self.cbam2(c4)
-        c5 = self.cbam3(c5)
-
+        # FPN
         p5 = self.lateral3(c5)
         p4 = self.smooth2(self.lateral2(c4) + F.interpolate(p5, size=c4.shape[2:], mode='nearest'))
         p3 = self.smooth1(self.lateral1(c3) + F.interpolate(p4, size=c3.shape[2:], mode='nearest'))
 
-        # Post-FPN CBAM (second attention round)
+        # Post-FPN CBAM
         p5 = self.fpn_cbam3(p5)
         p4 = self.fpn_cbam2(p4)
         p3 = self.fpn_cbam1(p3)
 
+        # Adaptive pooling
         p5_pool = F.adaptive_avg_pool2d(p5, 1).view(x.size(0), -1)
         p4_pool = F.adaptive_avg_pool2d(p4, 1).view(x.size(0), -1)
         p3_pool = F.adaptive_avg_pool2d(p3, 1).view(x.size(0), -1)
-        
-        # Adaptive weighted fusion (replaces simple addition)
         fpn_feat = self.adaptive_pooling([p3_pool, p4_pool, p5_pool])
 
-        fused = torch.cat([fpn_feat, color_feat], dim=1)
+        # Fuse + classify
+        fused = torch.cat([fpn_feat, side_feat], dim=1)
         return self.classifier(fused)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLASSIFIER WRAPPER
+# ═══════════════════════════════════════════════════════════════════════════════
+
 class CNNClassifier:
     """
-    CNN-based helmet classifier.
+    CNN-based helmet classifier v5.
+
+    Yeni özellikler:
+      - loss_type:       'focal' (default) veya 'ce'
+      - label_smoothing: 0.1 (default)
+      - mixup_alpha:     0.4 (default, 0 = kapalı)
+      - cutmix_alpha:    1.0 (default, 0 = kapalı)
+      - mixup_prob:      Her batch'te mixup/cutmix uygulanma olasılığı
+      - img_size:        224 (default) veya 384
+      - branch_type:     'edge_texture' (default) veya 'color'
+      - tta:             Test-Time Augmentation (predict_tta)
     """
-    def __init__(self, device=None, model_type='efficientnet'):
+    def __init__(self, device=None, model_type='efficientnet',
+                 img_size=224, branch_type='edge_texture',
+                 loss_type='focal', label_smoothing=0.1,
+                 mixup_alpha=0.4, cutmix_alpha=1.0, mixup_prob=0.5):
+
+        # ── Device ────────────────────────────────────────────────────────
         if device is None:
             try:
                 if torch.cuda.is_available():
@@ -327,18 +537,34 @@ class CNNClassifier:
                 self.device = torch.device('cpu')
         else:
             self.device = device
-        
+
         print(f"🖥️  Device: {self.device}")
-        
+
+        # ── Config ────────────────────────────────────────────────────────
         self.model_type = model_type
-        
-        self.model = HelmetClassifierNet(num_classes=2, pretrained=True).to(self.device)
+        self.img_size = img_size
+        self.branch_type = branch_type
+        self.loss_type = loss_type
+        self.label_smoothing = label_smoothing
+        self.mixup_alpha = mixup_alpha
+        self.cutmix_alpha = cutmix_alpha
+        self.mixup_prob = mixup_prob
+
+        # ── Model ─────────────────────────────────────────────────────────
+        self.model = HelmetClassifierNet(
+            num_classes=2, pretrained=True, branch_type=branch_type
+        ).to(self.device)
         self.model.freeze_backbone()
-        img_size = 224
-        print(f"🧠 Model: HelmetClassifierNet (EfficientNet-B0 + CBAM + FPN + Color, {img_size}x{img_size})")
-        
+
+        print(f"🧠 Model: HelmetClassifierNet v5 ({img_size}×{img_size})")
+        print(f"   Branch: {branch_type} | Loss: {loss_type} | Smoothing: {label_smoothing}")
+        print(f"   Mixup α={mixup_alpha} | CutMix α={cutmix_alpha} | prob={mixup_prob}")
+
+        # ── Transforms ────────────────────────────────────────────────────
+        resize_size = int(img_size * 256 / 224)  # 256 for 224, 438 for 384
+
         self.train_transform = transforms.Compose([
-            transforms.Resize((256, 256)),
+            transforms.Resize((resize_size, resize_size)),
             transforms.RandomResizedCrop(img_size, scale=(0.7, 1.0)),
             transforms.RandomHorizontalFlip(),
             transforms.RandomAffine(degrees=20, scale=(0.8, 1.2), translate=(0.1, 0.1)),
@@ -346,399 +572,413 @@ class CNNClassifier:
             transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.15),
             transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225]),
             transforms.RandomErasing(p=0.2, scale=(0.02, 0.15)),
         ])
-        
+
         self.test_transform = transforms.Compose([
             transforms.Resize((img_size, img_size)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
         ])
-        
+
+        # TTA transform'ları
+        self._tta_transforms = [
+            self.test_transform,
+            # Horizontal flip
+            transforms.Compose([
+                transforms.Resize((img_size, img_size)),
+                transforms.RandomHorizontalFlip(p=1.0),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+            ]),
+            # Center crop (tighter)
+            transforms.Compose([
+                transforms.Resize((resize_size, resize_size)),
+                transforms.CenterCrop(img_size),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+            ]),
+            # Slight scale down
+            transforms.Compose([
+                transforms.Resize((int(img_size * 0.9), int(img_size * 0.9))),
+                transforms.Pad(int(img_size * 0.05), fill=0),
+                transforms.Resize((img_size, img_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+            ]),
+        ]
+
+        # ── History ───────────────────────────────────────────────────────
         self.train_losses = []
         self.val_losses = []
         self.train_accs = []
         self.val_accs = []
-    
+
+    # ── Data ──────────────────────────────────────────────────────────────
+
     def prepare_data(self, dataset_dir, batch_size=32):
-        """
-        DataLoader'ları hazırlar.
-        """
+        """DataLoader'ları hazırlar."""
         print("📊 Dataset yükleniyor...")
-        
         train_dataset = HelmetDataset(dataset_dir, split='train', transform=self.train_transform)
         val_dataset = HelmetDataset(dataset_dir, split='val', transform=self.test_transform)
         test_dataset = HelmetDataset(dataset_dir, split='test', transform=self.test_transform)
-        
-        self.train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-        self.val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-        self.test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-        
+
+        self.train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True,
+            num_workers=4, pin_memory=True
+        )
+        self.val_loader = DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False,
+            num_workers=4, pin_memory=True
+        )
+        self.test_loader = DataLoader(
+            test_dataset, batch_size=batch_size, shuffle=False,
+            num_workers=4, pin_memory=True
+        )
+
         print(f"✓ Train: {len(train_dataset)} samples")
         print(f"✓ Val: {len(val_dataset)} samples")
         print(f"✓ Test: {len(test_dataset)} samples")
-    
-    def _run_epochs(self, num_epochs, criterion, optimizer, scheduler, best_val_acc,
-                    best_model_path, epoch_offset=0):
-        """
-        Epoch döngüsü — train() tarafından çağrılır.
-        """
-        for epoch in range(num_epochs):
-            global_epoch = epoch_offset + epoch + 1
-            self.model.train()
-            train_loss = 0.0
-            train_correct = 0
-            train_total = 0
-            
-            pbar = tqdm(self.train_loader, desc=f'Epoch {global_epoch}')
-            for images, labels in pbar:
-                images, labels = images.to(self.device), labels.to(self.device)
-                
+
+    # ── Loss ──────────────────────────────────────────────────────────────
+
+    def _build_criterion(self):
+        """Loss fonksiyonunu oluşturur."""
+        if self.loss_type == 'focal':
+            return FocalLoss(
+                alpha=0.25, gamma=2.0,
+                label_smoothing=self.label_smoothing
+            )
+        else:
+            return nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
+
+    # ── Training ──────────────────────────────────────────────────────────
+
+    def _train_one_epoch(self, epoch_num, criterion, optimizer):
+        """Tek epoch eğitim — Mixup/CutMix destekli."""
+        self.model.train()
+        train_loss = 0.0
+        train_correct = 0
+        train_total = 0
+
+        pbar = tqdm(self.train_loader, desc=f'Epoch {epoch_num}')
+        for images, labels in pbar:
+            images, labels = images.to(self.device), labels.to(self.device)
+
+            # ── Mixup / CutMix (olasılıkla) ──────────────────────────
+            use_mix = np.random.rand() < self.mixup_prob
+            if use_mix and (self.mixup_alpha > 0 or self.cutmix_alpha > 0):
+                # %50 Mixup, %50 CutMix (ikisi de aktifse)
+                if self.mixup_alpha > 0 and self.cutmix_alpha > 0:
+                    use_cutmix = np.random.rand() > 0.5
+                elif self.cutmix_alpha > 0:
+                    use_cutmix = True
+                else:
+                    use_cutmix = False
+
+                if use_cutmix:
+                    images, y_a, y_b, lam = cutmix_data(images, labels, self.cutmix_alpha)
+                else:
+                    images, y_a, y_b, lam = mixup_data(images, labels, self.mixup_alpha)
+
+                optimizer.zero_grad()
+                outputs = self.model(images)
+                loss = mixup_criterion(criterion, outputs, y_a, y_b, lam)
+                loss.backward()
+                optimizer.step()
+
+                # Accuracy: karışık label'larla (en yüksek ağırlıklı label)
+                _, predicted = outputs.max(1)
+                train_total += labels.size(0)
+                train_correct += (lam * predicted.eq(y_a).float()
+                                  + (1 - lam) * predicted.eq(y_b).float()).sum().item()
+            else:
+                # Normal training step
                 optimizer.zero_grad()
                 outputs = self.model(images)
                 loss = criterion(outputs, labels)
                 loss.backward()
                 optimizer.step()
-                
-                train_loss += loss.item()
+
                 _, predicted = outputs.max(1)
                 train_total += labels.size(0)
                 train_correct += predicted.eq(labels).sum().item()
-                
-                pbar.set_postfix({
-                    'loss': f'{loss.item():.4f}',
-                    'acc': f'{100.*train_correct/train_total:.2f}%'
-                })
-            
-            train_loss = train_loss / len(self.train_loader)
-            train_acc = 100. * train_correct / train_total
-            
-            val_loss, val_acc = self.validate()
-            
-            self.train_losses.append(train_loss)
-            self.val_losses.append(val_loss)
-            self.train_accs.append(train_acc)
-            self.val_accs.append(val_acc)
-            
-            if hasattr(scheduler, 'step'):
-                if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
-                    scheduler.step(val_loss)
-                else:
-                    scheduler.step()
-            
-            current_lr = optimizer.param_groups[0]['lr']
-            print(f"Epoch {global_epoch}")
-            print(f"  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
-            print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, LR: {current_lr:.6f}")
-            
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                self.save(best_model_path)
-                print(f"  ✓ Best model saved: {best_model_path} (Val Acc: {val_acc:.2f}%)")
-            
-            print("-"*60)
-        
-        return best_val_acc
 
-    def train(self, num_epochs=20, learning_rate=0.001,
-              output_dir='.', model_name='cnn_classifier_best.pth'):
-        """
-        Modeli eğitir.
-        EfficientNet modeli için 2-fazlı transfer learning uygular:
-          Phase 1: Backbone frozen, sadece head eğitilir (patience-based early stop)
-          Phase 2: Tüm ağ fine-tune edilir (düşük lr, kalan epoch'lar)
-        """
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        best_model_path = str(output_dir / model_name)
+            train_loss += loss.item()
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'acc': f'{100. * train_correct / train_total:.2f}%'
+            })
 
-        criterion = nn.CrossEntropyLoss()
-        best_val_acc = 0.0
-        
-        if self.model_type == 'efficientnet':
-            # Phase 1: patience-based early stopping
-            patience = 3
-            min_phase1 = 3
-            max_phase1 = num_epochs // 2
-            
-            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-            total = sum(p.numel() for p in self.model.parameters())
-            
-            print(f"\n🎯 Phase 1: Backbone frozen (max {max_phase1} epoch, patience={patience}, lr={learning_rate})")
-            print(f"   Eğitilebilir: {trainable:,} / {total:,} parametre")
-            print("="*60)
-            
-            self.model.freeze_backbone()
-            optimizer = optim.Adam(
-                filter(lambda p: p.requires_grad, self.model.parameters()),
-                lr=learning_rate, weight_decay=1e-4
-            )
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_phase1)
-            
-            best_phase1_val_loss = float('inf')
-            no_improve_count = 0
-            actual_phase1_epochs = max_phase1
-            
-            for epoch in range(max_phase1):
-                global_epoch = epoch + 1
-                self.model.train()
-                train_loss = 0.0
-                train_correct = 0
-                train_total = 0
-                
-                pbar = tqdm(self.train_loader, desc=f'Epoch {global_epoch}')
-                for images, labels in pbar:
-                    images, labels = images.to(self.device), labels.to(self.device)
-                    optimizer.zero_grad()
-                    outputs = self.model(images)
-                    loss = criterion(outputs, labels)
-                    loss.backward()
-                    optimizer.step()
-                    train_loss += loss.item()
-                    _, predicted = outputs.max(1)
-                    train_total += labels.size(0)
-                    train_correct += predicted.eq(labels).sum().item()
-                    pbar.set_postfix({'loss': f'{loss.item():.4f}', 'acc': f'{100.*train_correct/train_total:.2f}%'})
-                
-                train_loss = train_loss / len(self.train_loader)
-                train_acc = 100. * train_correct / train_total
-                val_loss, val_acc = self.validate()
-                
-                self.train_losses.append(train_loss)
-                self.val_losses.append(val_loss)
-                self.train_accs.append(train_acc)
-                self.val_accs.append(val_acc)
-                scheduler.step()
-                
-                current_lr = optimizer.param_groups[0]['lr']
-                print(f"Epoch {global_epoch}")
-                print(f"  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
-                print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, LR: {current_lr:.6f}")
-                
-                if val_acc > best_val_acc:
-                    best_val_acc = val_acc
-                    self.save(best_model_path)
-                    print(f"  ✓ Best model saved: {best_model_path} (Val Acc: {val_acc:.2f}%)")
-                
-                # Early stopping check
-                if val_loss < best_phase1_val_loss:
-                    best_phase1_val_loss = val_loss
-                    no_improve_count = 0
-                else:
-                    no_improve_count += 1
-                
-                if epoch >= min_phase1 and no_improve_count >= patience:
-                    actual_phase1_epochs = epoch + 1
-                    print(f"\n⏹️  Phase 1 early stopped at epoch {actual_phase1_epochs} "
-                          f"(no val_loss improvement for {patience} epochs)")
-                    break
-                
-                print("-"*60)
-            else:
-                actual_phase1_epochs = max_phase1
-            
-            # Phase 2: full fine-tuning with remaining epochs
-            phase2_epochs = num_epochs - actual_phase1_epochs
-            
-            print(f"\n🎯 Phase 2: Full fine-tuning ({phase2_epochs} epoch, lr={learning_rate * 0.1})")
-            self.model.unfreeze_backbone()
-            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-            print(f"   Eğitilebilir: {trainable:,} / {total:,} parametre")
-            print("="*60)
-            
-            optimizer = optim.Adam(self.model.parameters(), lr=learning_rate * 0.1, weight_decay=1e-4)
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=phase2_epochs)
-            best_val_acc = self._run_epochs(
-                phase2_epochs, criterion, optimizer, scheduler,
-                best_val_acc, best_model_path,
-                epoch_offset=actual_phase1_epochs
-            )
-        else:
-            print(f"\n🎯 CNN modeli eğitiliyor...")
-            print(f"Epochs: {num_epochs}, Learning Rate: {learning_rate}")
-            print("="*60)
-            
-            optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5)
-            best_val_acc = self._run_epochs(
-                num_epochs, criterion, optimizer, scheduler,
-                best_val_acc, best_model_path
-            )
-        
-        print(f"\n✅ Training tamamlandı! Best Val Acc: {best_val_acc:.2f}%")
-        print(f"✓ En iyi model yolu: {best_model_path}")
-        self.plot_training_history()
-        return best_model_path
-    
+        train_loss /= len(self.train_loader)
+        train_acc = 100. * train_correct / train_total
+        return train_loss, train_acc
+
     def validate(self):
-        """
-        Validation seti üzerinde değerlendirme yapar.
-        """
+        """Validation seti üzerinde değerlendirme."""
         self.model.eval()
         val_loss = 0.0
         val_correct = 0
         val_total = 0
         criterion = nn.CrossEntropyLoss()
-        
+
         with torch.no_grad():
             for images, labels in self.val_loader:
                 images, labels = images.to(self.device), labels.to(self.device)
                 outputs = self.model(images)
                 loss = criterion(outputs, labels)
-                
                 val_loss += loss.item()
                 _, predicted = outputs.max(1)
                 val_total += labels.size(0)
                 val_correct += predicted.eq(labels).sum().item()
-        
-        val_loss = val_loss / len(self.val_loader)
-        val_acc = 100. * val_correct / val_total
-        
-        return val_loss, val_acc
-    
-    def evaluate(self):
+
+        return val_loss / len(self.val_loader), 100. * val_correct / val_total
+
+    def train(self, num_epochs=30, learning_rate=0.001,
+              output_dir='.', model_name='helmet_classifier_v5.pth'):
         """
-        Test seti üzerinde değerlendirme yapar.
+        2-fazlı transfer learning ile eğitim.
+          Phase 1: Backbone frozen, head eğitimi (patience-based early stop)
+          Phase 2: Full fine-tuning (düşük lr)
         """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        best_model_path = str(output_dir / model_name)
+
+        criterion = self._build_criterion()
+        best_val_acc = 0.0
+
+        total = sum(p.numel() for p in self.model.parameters())
+
+        # ── Phase 1: Backbone frozen ─────────────────────────────────
+        patience = 3
+        min_phase1 = 3
+        max_phase1 = num_epochs // 2
+
+        self.model.freeze_backbone()
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+
+        print(f"\n🎯 Phase 1: Backbone frozen (max {max_phase1} ep, patience={patience})")
+        print(f"   Trainable: {trainable:,} / {total:,}")
+        print(f"   Loss: {self.loss_type} | Smoothing: {self.label_smoothing}")
+        print("=" * 60)
+
+        optimizer = optim.Adam(
+            filter(lambda p: p.requires_grad, self.model.parameters()),
+            lr=learning_rate, weight_decay=1e-4
+        )
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_phase1)
+
+        best_phase1_val_loss = float('inf')
+        no_improve_count = 0
+        actual_phase1_epochs = max_phase1
+
+        for epoch in range(max_phase1):
+            global_epoch = epoch + 1
+            train_loss, train_acc = self._train_one_epoch(global_epoch, criterion, optimizer)
+            val_loss, val_acc = self.validate()
+
+            self.train_losses.append(train_loss)
+            self.val_losses.append(val_loss)
+            self.train_accs.append(train_acc)
+            self.val_accs.append(val_acc)
+            scheduler.step()
+
+            lr = optimizer.param_groups[0]['lr']
+            print(f"Epoch {global_epoch}")
+            print(f"  Train Loss: {train_loss:.4f}, Acc: {train_acc:.2f}%")
+            print(f"  Val   Loss: {val_loss:.4f}, Acc: {val_acc:.2f}%, LR: {lr:.6f}")
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                self.save(best_model_path)
+                print(f"  ✓ Best model saved (Val Acc: {val_acc:.2f}%)")
+
+            if val_loss < best_phase1_val_loss:
+                best_phase1_val_loss = val_loss
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+
+            if epoch >= min_phase1 and no_improve_count >= patience:
+                actual_phase1_epochs = epoch + 1
+                print(f"\n⏹️  Phase 1 early stopped at epoch {actual_phase1_epochs}")
+                break
+
+            print("-" * 60)
+        else:
+            actual_phase1_epochs = max_phase1
+
+        # ── Phase 2: Full fine-tuning ────────────────────────────────
+        phase2_epochs = num_epochs - actual_phase1_epochs
+        phase2_lr = learning_rate * 0.1
+
+        print(f"\n🎯 Phase 2: Full fine-tuning ({phase2_epochs} ep, lr={phase2_lr})")
+        self.model.unfreeze_backbone()
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        print(f"   Trainable: {trainable:,} / {total:,}")
+        print("=" * 60)
+
+        optimizer = optim.Adam(self.model.parameters(), lr=phase2_lr, weight_decay=1e-4)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=phase2_epochs)
+
+        for epoch in range(phase2_epochs):
+            global_epoch = actual_phase1_epochs + epoch + 1
+            train_loss, train_acc = self._train_one_epoch(global_epoch, criterion, optimizer)
+            val_loss, val_acc = self.validate()
+
+            self.train_losses.append(train_loss)
+            self.val_losses.append(val_loss)
+            self.train_accs.append(train_acc)
+            self.val_accs.append(val_acc)
+            scheduler.step()
+
+            lr = optimizer.param_groups[0]['lr']
+            print(f"Epoch {global_epoch}")
+            print(f"  Train Loss: {train_loss:.4f}, Acc: {train_acc:.2f}%")
+            print(f"  Val   Loss: {val_loss:.4f}, Acc: {val_acc:.2f}%, LR: {lr:.6f}")
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                self.save(best_model_path)
+                print(f"  ✓ Best model saved (Val Acc: {val_acc:.2f}%)")
+
+            print("-" * 60)
+
+        print(f"\n✅ Training tamamlandı! Best Val Acc: {best_val_acc:.2f}%")
+        self.plot_training_history(output_dir)
+        return best_model_path
+
+    # ── Evaluation ────────────────────────────────────────────────────────
+
+    def evaluate(self, output_dir='.'):
+        """Test seti üzerinde değerlendirme."""
         self.model.eval()
-        all_preds = []
-        all_labels = []
-        all_probs = []
-        
+        all_preds, all_labels, all_probs = [], [], []
+
         print("\n📊 Test seti değerlendiriliyor...")
-        
         with torch.no_grad():
             for images, labels in tqdm(self.test_loader):
                 images = images.to(self.device)
                 outputs = self.model(images)
                 probs = torch.softmax(outputs, dim=1)
                 _, predicted = outputs.max(1)
-                
                 all_preds.extend(predicted.cpu().numpy())
                 all_labels.extend(labels.numpy())
                 all_probs.extend(probs.cpu().numpy())
-        
+
         all_preds = np.array(all_preds)
         all_labels = np.array(all_labels)
         all_probs = np.array(all_probs)
-        
-        print("\n" + "="*60)
-        print("📊 TEST SONUÇLARI")
-        print("="*60)
-        
+
         acc = accuracy_score(all_labels, all_preds)
+        print(f"\n{'='*60}")
+        print(f"📊 TEST SONUÇLARI")
+        print(f"{'='*60}")
         print(f"\nAccuracy: {acc:.4f}")
-        
         print("\nClassification Report:")
-        print(classification_report(all_labels, all_preds, target_names=['no_helmet', 'helmet']))
-        
-        print("\nConfusion Matrix:")
+        print(classification_report(all_labels, all_preds,
+                                    target_names=['no_helmet', 'helmet']))
         cm = confusion_matrix(all_labels, all_preds)
+        print("Confusion Matrix:")
         print(cm)
-        
-        self.plot_confusion_matrix(cm)
-        
+
+        self.plot_confusion_matrix(cm, output_dir)
+
         return {
             'accuracy': acc,
             'predictions': all_preds,
             'probabilities': all_probs,
             'confusion_matrix': cm
         }
-    
-    def plot_training_history(self):
-        """
-        Training history görselleştirir.
-        """
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
-        
-        epochs = range(1, len(self.train_losses) + 1)
-        
-        ax1.plot(epochs, self.train_losses, 'b-', label='Train Loss')
-        ax1.plot(epochs, self.val_losses, 'r-', label='Val Loss')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Loss')
-        ax1.set_title('Training and Validation Loss')
-        ax1.legend()
-        ax1.grid(True)
-        
-        ax2.plot(epochs, self.train_accs, 'b-', label='Train Acc')
-        ax2.plot(epochs, self.val_accs, 'r-', label='Val Acc')
-        ax2.set_xlabel('Epoch')
-        ax2.set_ylabel('Accuracy (%)')
-        ax2.set_title('Training and Validation Accuracy')
-        ax2.legend()
-        ax2.grid(True)
-        
-        plt.tight_layout()
-        plt.savefig('cnn_classifier_training_history.png', dpi=150)
-        print(f"\n✓ Training history kaydedildi: cnn_classifier_training_history.png")
-        plt.close()
-    
-    def plot_confusion_matrix(self, cm):
-        """
-        Confusion matrix görselleştirir.
-        """
-        plt.figure(figsize=(8, 6))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                    xticklabels=['no_helmet', 'helmet'],
-                    yticklabels=['no_helmet', 'helmet'])
-        plt.title('CNN Classifier - Confusion Matrix')
-        plt.ylabel('True Label')
-        plt.xlabel('Predicted Label')
-        plt.tight_layout()
-        plt.savefig('cnn_classifier_confusion_matrix.png', dpi=150)
-        print(f"✓ Confusion matrix kaydedildi: cnn_classifier_confusion_matrix.png")
-        plt.close()
-    
+
+    # ── Prediction ────────────────────────────────────────────────────────
+
     def predict(self, image_path, return_proba=False):
-        """
-        Tek bir görüntü için tahmin yapar.
-        """
+        """Tek görüntü tahmini."""
         self.model.eval()
-        
         image = Image.open(image_path).convert('RGB')
-        image = self.test_transform(image).unsqueeze(0).to(self.device)
-        
+        tensor = self.test_transform(image).unsqueeze(0).to(self.device)
+
         with torch.no_grad():
-            output = self.model(image)
+            output = self.model(tensor)
             probs = torch.softmax(output, dim=1)[0]
             pred = output.argmax(1).item()
-        
+
         if return_proba:
             return {
                 'prediction': pred,
                 'confidence': float(probs[pred]),
-                'probabilities': {'no_helmet': float(probs[0]), 'helmet': float(probs[1])}
+                'probabilities': {
+                    'no_helmet': float(probs[0]),
+                    'helmet': float(probs[1])
+                }
             }
-        else:
-            return pred
-    
-    def predict_batch(self, images, return_proba=False):
+        return pred
+
+    def predict_tta(self, image_input, return_proba=False):
         """
-        Birden fazla görüntü için batch tahmin yapar.
-        
+        Test-Time Augmentation ile tahmin.
+
+        4 farklı görünüm üzerinde tahmin yapıp ortalamasını alır.
+        Overconfidence azaltır, borderline vakalarda doğruluğu artırır.
+
         Args:
-            images: List of PIL Images veya list of image paths
-            return_proba: True ise olasılık dön
-        Returns:
-            List of predictions
+            image_input: PIL Image veya dosya yolu
+            return_proba: True ise detaylı sonuç döner
         """
         self.model.eval()
-        
+
+        if isinstance(image_input, (str, Path)):
+            image = Image.open(image_input).convert('RGB')
+        else:
+            image = image_input
+
+        all_probs = []
+        for t in self._tta_transforms:
+            tensor = t(image).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                output = self.model(tensor)
+                probs = torch.softmax(output, dim=1)
+                all_probs.append(probs)
+
+        # Ortalamalı olasılık
+        avg_probs = torch.stack(all_probs).mean(dim=0)[0]
+        pred = avg_probs.argmax().item()
+
+        if return_proba:
+            return {
+                'prediction': pred,
+                'confidence': float(avg_probs[pred]),
+                'probabilities': {
+                    'no_helmet': float(avg_probs[0]),
+                    'helmet': float(avg_probs[1])
+                },
+                'tta_views': len(self._tta_transforms)
+            }
+        return pred
+
+    def predict_batch(self, images, return_proba=False):
+        """Batch tahmin — pipeline uyumlu."""
+        self.model.eval()
         batch_tensors = []
         for img in images:
             if isinstance(img, (str, Path)):
                 img = Image.open(img).convert('RGB')
             batch_tensors.append(self.test_transform(img))
-        
+
         batch = torch.stack(batch_tensors).to(self.device)
-        
         with torch.no_grad():
             outputs = self.model(batch)
             probs = torch.softmax(outputs, dim=1)
             preds = outputs.argmax(1)
-        
+
         results = []
         for i in range(len(images)):
             if return_proba:
@@ -752,105 +992,327 @@ class CNNClassifier:
                 })
             else:
                 results.append(int(preds[i]))
-        
         return results
-    
+
+    def predict_batch_tta(self, images, return_proba=False):
+        """Batch TTA tahmini — her görüntü için çoklu görünüm."""
+        results = []
+        for img in images:
+            r = self.predict_tta(img, return_proba=return_proba)
+            results.append(r)
+        return results
+
+    # ── Grad-CAM ──────────────────────────────────────────────────────────
+
+    def gradcam(self, image_input, target_class=None, target_layer=None):
+        """
+        Grad-CAM heatmap üretir — modelin görüntünün neresine baktığını gösterir.
+
+        Args:
+            image_input: PIL Image veya dosya yolu
+            target_class: Hedef sınıf (None = predicted class)
+            target_layer: Hook katmanı (None = fpn_cbam3)
+
+        Returns:
+            dict: {
+                'heatmap':     np.array (H, W) 0-1 float — raw heatmap
+                'overlay':     np.array (H, W, 3) uint8  — görüntü üzerine overlay
+                'prediction':  int
+                'confidence':  float
+                'probabilities': dict
+            }
+        """
+        import cv2
+
+        self.model.eval()
+
+        if isinstance(image_input, (str, Path)):
+            pil_img = Image.open(image_input).convert('RGB')
+        else:
+            pil_img = image_input
+
+        # Hook kaydet
+        hooks = self.model.register_gradcam_hooks(target_layer)
+
+        # Forward
+        tensor = self.test_transform(pil_img).unsqueeze(0).to(self.device)
+        tensor.requires_grad_(True)
+        output = self.model(tensor)
+        probs = torch.softmax(output, dim=1)[0]
+        pred = output.argmax(1).item()
+
+        if target_class is None:
+            target_class = pred
+
+        # Backward (hedef sınıf için gradient)
+        self.model.zero_grad()
+        output[0, target_class].backward()
+
+        # Grad-CAM hesapla
+        gradients = self.model._gradcam_gradients  # (1, C, H, W)
+        activations = self.model._gradcam_activations  # (1, C, H, W)
+
+        weights = gradients.mean(dim=[2, 3], keepdim=True)  # GAP
+        cam = (weights * activations).sum(dim=1, keepdim=True)  # Weighted sum
+        cam = F.relu(cam)  # ReLU
+        cam = cam.squeeze().detach().cpu().numpy()
+
+        # Normalize 0-1
+        if cam.max() > 0:
+            cam = cam / cam.max()
+
+        # Resize to original image size
+        img_np = np.array(pil_img)
+        cam_resized = cv2.resize(cam, (img_np.shape[1], img_np.shape[0]))
+
+        # Overlay oluştur
+        heatmap_colored = cv2.applyColorMap(
+            (cam_resized * 255).astype(np.uint8), cv2.COLORMAP_JET
+        )
+        heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
+        overlay = (0.6 * img_np + 0.4 * heatmap_colored).astype(np.uint8)
+
+        # Hook temizle
+        for h in hooks:
+            h.remove()
+        self.model._gradcam_activations = None
+        self.model._gradcam_gradients = None
+
+        return {
+            'heatmap': cam_resized,
+            'overlay': overlay,
+            'prediction': pred,
+            'confidence': float(probs[pred]),
+            'probabilities': {
+                'no_helmet': float(probs[0]),
+                'helmet': float(probs[1])
+            }
+        }
+
+    def gradcam_comparison(self, image_input, save_path=None):
+        """
+        Birden fazla katmanda Grad-CAM karşılaştırması yapar.
+        FPN katmanları + side branch'i karşılaştırır.
+
+        Args:
+            image_input: PIL Image veya dosya yolu
+            save_path: Kaydedilecek dosya yolu (None = göster)
+
+        Returns:
+            fig: matplotlib Figure
+        """
+        import cv2
+
+        if isinstance(image_input, (str, Path)):
+            pil_img = Image.open(image_input).convert('RGB')
+        else:
+            pil_img = image_input
+
+        layers = {
+            'Stage 3 (high-level)': self.model.cbam3,
+            'FPN P5 (coarse)': self.model.fpn_cbam3,
+            'FPN P4 (mid)': self.model.fpn_cbam2,
+            'FPN P3 (fine)': self.model.fpn_cbam1,
+        }
+
+        fig, axes = plt.subplots(1, len(layers) + 1, figsize=(4 * (len(layers) + 1), 4))
+
+        # Original
+        axes[0].imshow(pil_img)
+        axes[0].set_title('Original')
+        axes[0].axis('off')
+
+        for i, (name, layer) in enumerate(layers.items()):
+            result = self.gradcam(pil_img, target_layer=layer)
+            axes[i + 1].imshow(result['overlay'])
+            axes[i + 1].set_title(f'{name}\n{result["confidence"]:.1%}')
+            axes[i + 1].axis('off')
+
+        pred_label = 'helmet' if result['prediction'] == 1 else 'no_helmet'
+        fig.suptitle(f'Grad-CAM: {pred_label} ({result["confidence"]:.1%})',
+                     fontsize=14, fontweight='bold')
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"✓ Grad-CAM kaydedildi: {save_path}")
+        plt.close()
+        return fig
+
+    # ── Save / Load ───────────────────────────────────────────────────────
+
     def save(self, filepath):
-        """
-        Modeli kaydeder.
-        """
+        """Modeli kaydeder."""
         torch.save({
             'model_state_dict': self.model.state_dict(),
             'model_type': self.model_type,
+            'branch_type': self.branch_type,
+            'img_size': self.img_size,
+            'loss_type': self.loss_type,
+            'label_smoothing': self.label_smoothing,
+            'mixup_alpha': self.mixup_alpha,
+            'cutmix_alpha': self.cutmix_alpha,
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
             'train_accs': self.train_accs,
-            'val_accs': self.val_accs
+            'val_accs': self.val_accs,
         }, filepath)
-    
+
     def load(self, filepath):
         """
-        Modeli yükler.
+        Modeli yükler. v4 (color branch) ve v5 (edge_texture) uyumlu.
         """
-        checkpoint = torch.load(filepath, map_location=self.device)
-        
+        checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
+
         saved_type = checkpoint.get('model_type', 'efficientnet')
-        if saved_type != self.model_type:
-            print(f"⚠️  Checkpoint model_type='{saved_type}', yeniden oluşturuluyor...")
-            self.model_type = saved_type
-        
+        saved_branch = checkpoint.get('branch_type', 'color')  # v4 default
+        saved_img_size = checkpoint.get('img_size', 224)
+
         if saved_type != 'efficientnet':
-            raise ValueError(
-                f"Unsupported model_type='{saved_type}'. "
-                "Only 'efficientnet' (HelmetClassifierNet) is supported. "
-                "Legacy models (lightweight, color_aware) are deprecated."
-            )
-        
-        self.model = HelmetClassifierNet(num_classes=2, pretrained=False).to(self.device)
-        img_size = 224
+            raise ValueError(f"Unsupported model_type='{saved_type}'.")
+
+        # Branch type ve img_size güncelle
+        self.branch_type = saved_branch
+        self.img_size = saved_img_size
+
+        self.model = HelmetClassifierNet(
+            num_classes=2, pretrained=False, branch_type=saved_branch
+        ).to(self.device)
+
         self.test_transform = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
+            transforms.Resize((saved_img_size, saved_img_size)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
         ])
-        
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+
+        # v4 → v5 state_dict uyumu: color_branch → side_branch
+        state_dict = checkpoint['model_state_dict']
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            # v4 checkpoint'ta color_branch varsa side_branch'e map et
+            new_key = k.replace('color_branch.', 'side_branch.')
+            new_state_dict[new_key] = v
+
+        self.model.load_state_dict(new_state_dict, strict=False)
         self.train_losses = checkpoint.get('train_losses', [])
         self.val_losses = checkpoint.get('val_losses', [])
         self.train_accs = checkpoint.get('train_accs', [])
         self.val_accs = checkpoint.get('val_accs', [])
+
         print(f"✓ Model yüklendi: {filepath}")
+        print(f"  Branch: {saved_branch} | Size: {saved_img_size} | "
+              f"Epochs: {len(self.train_losses)}")
+
+    # ── Visualization ─────────────────────────────────────────────────────
+
+    def plot_training_history(self, output_dir='.'):
+        """Training history görselleştirir."""
+        output_dir = Path(output_dir)
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+
+        epochs = range(1, len(self.train_losses) + 1)
+        ax1.plot(epochs, self.train_losses, 'b-', label='Train Loss')
+        ax1.plot(epochs, self.val_losses, 'r-', label='Val Loss')
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Loss')
+        ax1.set_title('Training and Validation Loss')
+        ax1.legend()
+        ax1.grid(True)
+
+        ax2.plot(epochs, self.train_accs, 'b-', label='Train Acc')
+        ax2.plot(epochs, self.val_accs, 'r-', label='Val Acc')
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('Accuracy (%)')
+        ax2.set_title('Training and Validation Accuracy')
+        ax2.legend()
+        ax2.grid(True)
+
+        plt.tight_layout()
+        save_path = output_dir / 'training_history.png'
+        plt.savefig(str(save_path), dpi=150)
+        print(f"✓ Training history: {save_path}")
+        plt.close()
+
+    def plot_confusion_matrix(self, cm, output_dir='.'):
+        """Confusion matrix görselleştirir."""
+        output_dir = Path(output_dir)
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                    xticklabels=['no_helmet', 'helmet'],
+                    yticklabels=['no_helmet', 'helmet'])
+        plt.title('Confusion Matrix')
+        plt.ylabel('True Label')
+        plt.xlabel('Predicted Label')
+        plt.tight_layout()
+        save_path = output_dir / 'confusion_matrix.png'
+        plt.savefig(str(save_path), dpi=150)
+        print(f"✓ Confusion matrix: {save_path}")
+        plt.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description='CNN Helmet Classifier Training')
-    parser.add_argument('--model', type=str, default='efficientnet',
-                        choices=['efficientnet'],
-                        help='Model mimarisi: efficientnet (HelmetClassifierNet: EfficientNet-B0 + CBAM + FPN + Color)')
-    parser.add_argument('--epochs', type=int, default=30, help='Epoch sayısı')
-    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
-    parser.add_argument('--batch-size', type=int, default=32, help='Batch size')
-    parser.add_argument('--dataset', type=str,
-                        default='/home/berhan/Development/personal/HelmetClassCorrector/dataset',
-                        help='Dataset klasörü')
-    parser.add_argument('--output-dir', type=str, default='.',
-                        help='Eğitim çıktılarının kaydedileceği klasör')
-    parser.add_argument('--model-name', type=str, default='cnn_classifier_best.pth',
-                        help='Kaydedilecek en iyi model dosya adı')
+    parser = argparse.ArgumentParser(
+        description='Helmet Classifier v5 Training',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    parser.add_argument('--dataset', type=str, default='dataset')
+    parser.add_argument('--epochs', type=int, default=30)
+    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--batch-size', type=int, default=16)
+    parser.add_argument('--img-size', type=int, default=224, choices=[224, 384])
+    parser.add_argument('--branch', type=str, default='edge_texture',
+                        choices=['edge_texture', 'color'])
+    parser.add_argument('--loss', type=str, default='focal', choices=['focal', 'ce'])
+    parser.add_argument('--label-smoothing', type=float, default=0.1)
+    parser.add_argument('--mixup-alpha', type=float, default=0.4)
+    parser.add_argument('--cutmix-alpha', type=float, default=1.0)
+    parser.add_argument('--mixup-prob', type=float, default=0.5)
+    parser.add_argument('--output-dir', type=str, default='models/trained')
+    parser.add_argument('--model-name', type=str, default='helmet_classifier_v5.pth')
     args = parser.parse_args()
 
-    print("="*60)
-    print("CNN CLASSIFIER TRAINING")
-    print("="*60)
-    print(f"Architecture: {args.model}")
-    print(f"Epochs: {args.epochs}, LR: {args.lr}, Batch: {args.batch_size}")
-    print("="*60)
-    
-    classifier = CNNClassifier(model_type=args.model)
-    
+    print("=" * 70)
+    print(" " * 15 + "HELMET CLASSIFIER v5 TRAINING")
+    print("=" * 70)
+
+    classifier = CNNClassifier(
+        img_size=args.img_size,
+        branch_type=args.branch,
+        loss_type=args.loss,
+        label_smoothing=args.label_smoothing,
+        mixup_alpha=args.mixup_alpha,
+        cutmix_alpha=args.cutmix_alpha,
+        mixup_prob=args.mixup_prob,
+    )
+
     total_params = sum(p.numel() for p in classifier.model.parameters())
-    trainable_params = sum(p.numel() for p in classifier.model.parameters() if p.requires_grad)
-    print(f"📐 Toplam parametre: {total_params:,}")
-    print(f"📐 Eğitilebilir parametre: {trainable_params:,}")
-    print("="*60)
-    
+    trainable = sum(p.numel() for p in classifier.model.parameters() if p.requires_grad)
+    print(f"📐 Total: {total_params:,} | Trainable: {trainable:,}")
+    print("=" * 70)
+
     classifier.prepare_data(args.dataset, batch_size=args.batch_size)
-    
-    best_model_path = classifier.train(
+
+    best_path = classifier.train(
         num_epochs=args.epochs,
         learning_rate=args.lr,
         output_dir=args.output_dir,
-        model_name=args.model_name
+        model_name=args.model_name,
     )
-    
-    classifier.load(best_model_path)
-    results = classifier.evaluate()
-    
-    print("\n" + "="*60)
-    print("✅ TRAINING TAMAMLANDI")
-    print("="*60)
-    print(f"Final Test Accuracy: {results['accuracy']:.4f}")
-    print("="*60)
+
+    classifier.load(best_path)
+    results = classifier.evaluate(output_dir=args.output_dir)
+
+    print(f"\n{'='*70}")
+    print(f"✅ TRAINING TAMAMLANDI — Test Acc: {results['accuracy']:.4f}")
+    print(f"{'='*70}")
+
 
 if __name__ == "__main__":
     main()

@@ -23,9 +23,9 @@ from PIL import Image
 PROJECT_ROOT = Path(__file__).resolve().parent
 YOLOV9_DIR = PROJECT_ROOT / "yolov9"
 YOLO_WEIGHTS = PROJECT_ROOT / "models" / "trained" / "e200_scratch.pt"
-CNN_WEIGHTS = PROJECT_ROOT / "models" / "trained" / "helmet_classifier_v3.pth"
+CNN_WEIGHTS = PROJECT_ROOT / "models" / "trained" / "helmet_classifier_v4.pth"
 INPUT_DIR = PROJECT_ROOT / "test" / "images"
-OUTPUT_DIR = PROJECT_ROOT / "results" / "250326_results"
+OUTPUT_DIR = PROJECT_ROOT / "results" / "300326_results"
 
 # ── PyTorch 2.6+ compat ─────────────────────────────────────────────────────
 _original_torch_load = torch.load
@@ -63,7 +63,7 @@ def get_yolo_model():
 
 @st.cache_resource
 def get_cnn_model():
-    classifier = CNNClassifier(model_type="efficientnet")
+    classifier = CNNClassifier()
     classifier.load(str(CNN_WEIGHTS))
     classifier.model.eval()
     return classifier
@@ -97,47 +97,8 @@ def yolo_detect(model, img_bgr, device, imgsz, stride, conf_thres, iou_thres):
     return detections
 
 
-def classify_crop(classifier, crop_bgr):
-    crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(crop_rgb)
-    tensor = classifier.test_transform(pil_img).unsqueeze(0).to(classifier.device)
-    with torch.no_grad():
-        output = classifier.model(tensor)
-        probs = torch.softmax(output, dim=1)[0]
-    pred_idx = probs.argmax().item()
-    labels = {0: "no_helmet", 1: "helmet"}
-    return {
-        "label": labels[pred_idx],
-        "confidence": float(probs[pred_idx]),
-        "proba_helmet": float(probs[1]),
-        "proba_no_helmet": float(probs[0]),
-    }
-
-
 def bgr_to_rgb(img):
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-
-MIN_BBOX_SIZE = 40  # minimum piksel (genişlik ve yükseklik)
-
-
-def filter_detections(detections, img_shape, min_size=MIN_BBOX_SIZE):
-    """
-    Küçük bbox'ları filtreler — CNN'e göndermeden önce.
-    Çok küçük crop'lar 224×224'e resize edildiğinde blur/artifact yaratır.
-    """
-    h, w = img_shape[:2]
-    filtered = []
-    for det in detections:
-        x1 = max(0, det["x1"])
-        y1 = max(0, det["y1"])
-        x2 = min(w, det["x2"])
-        y2 = min(h, det["y2"])
-        bw = x2 - x1
-        bh = y2 - y1
-        if bw >= min_size and bh >= min_size:
-            filtered.append({**det, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
-    return filtered
 
 
 COLORS = {"helmet": (0, 200, 0), "no_helmet": (0, 0, 255)}
@@ -193,7 +154,7 @@ def main():
     with st.spinner("Modeller yükleniyor..."):
         yolo_model, dev, imgsz, stride = get_yolo_model()
         cnn_classifier = get_cnn_model()
-    st.sidebar.success(f"Modeller hazır (CNN: {cnn_classifier.model_type})")
+    st.sidebar.success(f"Modeller hazır (CNN: {cnn_classifier.branch_type})")
 
     # ── Image selection ──────────────────────────────────────────────────────
     img_extensions = {".jpg", ".jpeg", ".png", ".bmp"}
@@ -243,9 +204,6 @@ def main():
         # ── STEP 3: Crop Detections ──────────────────────────────────────
         st.markdown("---")
         st.header("Adım 3: Kırpılmış Tespitler")
-
-        # Filter small detections
-        detections = filter_detections(detections, img_bgr.shape)
 
         crops = []
         valid_detections = []
@@ -355,8 +313,6 @@ def main():
 
             h, w = img_bgr.shape[:2]
             detections = yolo_detect(yolo_model, img_bgr, dev, imgsz, stride, conf_thres, iou_thres)
-
-            detections = filter_detections(detections, img_bgr.shape)
 
             # Batch CNN inference
             crops_pil = [
