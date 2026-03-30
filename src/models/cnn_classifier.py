@@ -852,12 +852,14 @@ class CNNClassifier:
             print("-" * 60)
 
         print(f"\n✅ Training tamamlandı! Best Val Acc: {best_val_acc:.2f}%")
-        self.plot_training_history(output_dir)
+        # Training history'yi model ile aynı klasöre kaydet
+        model_dir = Path(best_model_path).parent
+        self.plot_training_history(model_dir)
         return best_model_path
 
     # ── Evaluation ────────────────────────────────────────────────────────
 
-    def evaluate(self, output_dir='.'):
+    def evaluate(self, model_path=None):
         """Test seti üzerinde değerlendirme."""
         self.model.eval()
         all_preds, all_labels, all_probs = [], [], []
@@ -889,6 +891,11 @@ class CNNClassifier:
         print("Confusion Matrix:")
         print(cm)
 
+        # Confusion matrix'i model ile aynı klasöre kaydet
+        if model_path:
+            output_dir = Path(model_path).parent
+        else:
+            output_dir = Path('.')
         self.plot_confusion_matrix(cm, output_dir)
 
         return {

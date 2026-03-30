@@ -132,18 +132,18 @@ def main():
     # Evaluate
     print("\n📊 Final değerlendirme...")
     classifier.load(best_model_path)
-    results = classifier.evaluate(output_dir=args.output_dir)
+    results = classifier.evaluate(model_path=best_model_path)
 
     # Summary
-    output_dir = Path(args.output_dir)
+    model_dir = Path(best_model_path).parent
     print(f"\n{'='*70}")
     print(f"✅ EĞİTİM TAMAMLANDI!")
     print(f"{'='*70}")
     print(f"\n📈 Test Accuracy: {results['accuracy']:.2%}")
     print(f"\n💾 Dosyalar:")
     print(f"  • {best_model_path}")
-    print(f"  • {output_dir / 'training_history.png'}")
-    print(f"  • {output_dir / 'confusion_matrix.png'}")
+    print(f"  • {model_dir / 'training_history.png'}")
+    print(f"  • {model_dir / 'confusion_matrix.png'}")
     print(f"\n🔬 Sonraki adım — Grad-CAM analizi:")
     print(f"  python grad_cam_analysis.py --model {best_model_path} --dataset {args.dataset_dir} --tta")
     print(f"\n🚀 Pipeline testi:")
