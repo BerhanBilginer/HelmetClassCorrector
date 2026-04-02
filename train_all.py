@@ -16,6 +16,9 @@ Kullanım örnekleri:
   # Edge-texture branch yerine color branch (v4 karşılaştırma)
   python train_all.py --dataset-dir dataset --branch color --model-name v5_color.pth
 
+  # Colab crash sonrası kaldığı yerden devam
+  python train_all.py --dataset-dir dataset --resume
+
   # Agresif ayarlar (GPU bellek yeterliyse)
   python train_all.py --dataset-dir dataset --img-size 384 --batch-size 8 \
                       --epochs 40 --lr 0.0008 --label-smoothing 0.15
@@ -62,6 +65,10 @@ def parse_args():
     # Output
     parser.add_argument('--output-dir', type=str, default='models/trained')
     parser.add_argument('--model-name', type=str, default='helmet_classifier_v5.pth')
+
+    # Resume
+    parser.add_argument('--resume', action='store_true',
+                        help='Checkpoint\'tan kaldığı yerden devam et')
 
     return parser.parse_args()
 
@@ -121,12 +128,16 @@ def main():
     classifier.prepare_data(args.dataset_dir, batch_size=args.batch_size)
 
     # Train
-    print("\n🚀 Eğitim başlatılıyor...")
+    if args.resume:
+        print("\n🔄 Checkpoint'tan devam ediliyor...")
+    else:
+        print("\n🚀 Eğitim başlatılıyor...")
     best_model_path = classifier.train(
         num_epochs=args.epochs,
         learning_rate=args.lr,
         output_dir=args.output_dir,
         model_name=args.model_name,
+        resume=args.resume,
     )
 
     # Evaluate
@@ -142,6 +153,7 @@ def main():
     print(f"\n📈 Test Accuracy: {results['accuracy']:.2%}")
     print(f"\n💾 Dosyalar:")
     print(f"  • {best_model_path}")
+    print(f"  • {model_dir / 'checkpoint_last.pth'}")
     print(f"  • {model_dir / 'training_history.png'}")
     print(f"  • {model_dir / 'confusion_matrix.png'}")
     print(f"\n🔬 Sonraki adım — Grad-CAM analizi:")

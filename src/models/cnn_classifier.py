@@ -740,95 +740,211 @@ class CNNClassifier:
 
         return val_loss / len(self.val_loader), 100. * val_correct / val_total
 
+    def _save_checkpoint(self, checkpoint_path, epoch, phase, optimizer, scheduler,
+                         best_val_acc, actual_phase1_epochs,
+                         best_phase1_val_loss, no_improve_count,
+                         num_epochs, learning_rate):
+        """Eğitim durumunu checkpoint olarak kaydeder."""
+        torch.save({
+            # Model state
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            # Training progress
+            'epoch': epoch,
+            'phase': phase,
+            'best_val_acc': best_val_acc,
+            'actual_phase1_epochs': actual_phase1_epochs,
+            'best_phase1_val_loss': best_phase1_val_loss,
+            'no_improve_count': no_improve_count,
+            # History
+            'train_losses': self.train_losses,
+            'val_losses': self.val_losses,
+            'train_accs': self.train_accs,
+            'val_accs': self.val_accs,
+            # Config (resume sırasında doğrulama için)
+            'num_epochs': num_epochs,
+            'learning_rate': learning_rate,
+            'model_type': self.model_type,
+            'branch_type': self.branch_type,
+            'img_size': self.img_size,
+            'loss_type': self.loss_type,
+            'label_smoothing': self.label_smoothing,
+            'mixup_alpha': self.mixup_alpha,
+            'cutmix_alpha': self.cutmix_alpha,
+        }, checkpoint_path)
+
+    def _load_checkpoint(self, checkpoint_path):
+        """Checkpoint'tan eğitim durumunu yükler."""
+        ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+
+        # Model state yükle
+        self.model.load_state_dict(ckpt['model_state_dict'])
+
+        # History geri yükle
+        self.train_losses = ckpt.get('train_losses', [])
+        self.val_losses = ckpt.get('val_losses', [])
+        self.train_accs = ckpt.get('train_accs', [])
+        self.val_accs = ckpt.get('val_accs', [])
+
+        return ckpt
+
     def train(self, num_epochs=30, learning_rate=0.001,
-              output_dir='.', model_name='helmet_classifier_v5.pth'):
+              output_dir='.', model_name='helmet_classifier_v5.pth',
+              resume=False):
         """
         2-fazlı transfer learning ile eğitim.
           Phase 1: Backbone frozen, head eğitimi (patience-based early stop)
           Phase 2: Full fine-tuning (düşük lr)
+
+        Args:
+            resume: True ise output_dir/checkpoint_last.pth'den devam eder
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         best_model_path = str(output_dir / model_name)
+        checkpoint_path = str(output_dir / 'checkpoint_last.pth')
+
+        print(f"\n📂 Output dizini: {output_dir.resolve()}")
 
         criterion = self._build_criterion()
         best_val_acc = 0.0
-
         total = sum(p.numel() for p in self.model.parameters())
 
-        # ── Phase 1: Backbone frozen ─────────────────────────────────
         patience = 3
         min_phase1 = 3
         max_phase1 = num_epochs // 2
 
-        self.model.freeze_backbone()
-        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-
-        print(f"\n🎯 Phase 1: Backbone frozen (max {max_phase1} ep, patience={patience})")
-        print(f"   Trainable: {trainable:,} / {total:,}")
-        print(f"   Loss: {self.loss_type} | Smoothing: {self.label_smoothing}")
-        print("=" * 60)
-
-        optimizer = optim.Adam(
-            filter(lambda p: p.requires_grad, self.model.parameters()),
-            lr=learning_rate, weight_decay=1e-4
-        )
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_phase1)
-
+        # ── Resume kontrolü ──────────────────────────────────────────
+        resume_epoch = 0
+        resume_phase = 1
+        actual_phase1_epochs = max_phase1
         best_phase1_val_loss = float('inf')
         no_improve_count = 0
-        actual_phase1_epochs = max_phase1
+        phase1_early_stopped = False
 
-        for epoch in range(max_phase1):
-            global_epoch = epoch + 1
-            train_loss, train_acc = self._train_one_epoch(global_epoch, criterion, optimizer)
-            val_loss, val_acc = self.validate()
+        if resume and Path(checkpoint_path).exists():
+            print(f"\n🔄 Checkpoint bulundu: {checkpoint_path}")
+            ckpt = self._load_checkpoint(checkpoint_path)
 
-            self.train_losses.append(train_loss)
-            self.val_losses.append(val_loss)
-            self.train_accs.append(train_acc)
-            self.val_accs.append(val_acc)
-            scheduler.step()
+            resume_epoch = ckpt['epoch']
+            resume_phase = ckpt['phase']
+            best_val_acc = ckpt['best_val_acc']
+            actual_phase1_epochs = ckpt.get('actual_phase1_epochs', max_phase1)
+            best_phase1_val_loss = ckpt.get('best_phase1_val_loss', float('inf'))
+            no_improve_count = ckpt.get('no_improve_count', 0)
 
-            lr = optimizer.param_groups[0]['lr']
-            print(f"Epoch {global_epoch}")
-            print(f"  Train Loss: {train_loss:.4f}, Acc: {train_acc:.2f}%")
-            print(f"  Val   Loss: {val_loss:.4f}, Acc: {val_acc:.2f}%, LR: {lr:.6f}")
+            print(f"   Epoch {resume_epoch}/{num_epochs} | Phase {resume_phase}")
+            print(f"   Best Val Acc: {best_val_acc:.2f}%")
+            print(f"   History: {len(self.train_losses)} epochs kaydedilmiş")
 
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                self.save(best_model_path)
-                print(f"  ✓ Best model saved (Val Acc: {val_acc:.2f}%)")
+            # Phase 1 bitmişse (resume_phase == 2) → doğrudan phase 2'ye atla
+            if resume_phase == 2:
+                phase1_early_stopped = True
+                actual_phase1_epochs = ckpt['actual_phase1_epochs']
+        elif resume:
+            print(f"\n⚠️  Checkpoint bulunamadı: {checkpoint_path}")
+            print("   Sıfırdan başlanıyor...")
 
-            if val_loss < best_phase1_val_loss:
-                best_phase1_val_loss = val_loss
-                no_improve_count = 0
+        # ── Phase 1: Backbone frozen ─────────────────────────────────
+        if not phase1_early_stopped and resume_epoch < max_phase1:
+            self.model.freeze_backbone()
+            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+
+            phase1_start = resume_epoch if (resume and resume_phase == 1) else 0
+
+            print(f"\n🎯 Phase 1: Backbone frozen (max {max_phase1} ep, patience={patience})")
+            if phase1_start > 0:
+                print(f"   ▶ Epoch {phase1_start + 1}'den devam ediliyor")
+            print(f"   Trainable: {trainable:,} / {total:,}")
+            print(f"   Loss: {self.loss_type} | Smoothing: {self.label_smoothing}")
+            print("=" * 60)
+
+            optimizer = optim.Adam(
+                filter(lambda p: p.requires_grad, self.model.parameters()),
+                lr=learning_rate, weight_decay=1e-4
+            )
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_phase1)
+
+            # Resume: optimizer ve scheduler state'ini geri yükle
+            if resume and resume_phase == 1 and Path(checkpoint_path).exists():
+                ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+
+            for epoch in range(phase1_start, max_phase1):
+                global_epoch = epoch + 1
+                train_loss, train_acc = self._train_one_epoch(global_epoch, criterion, optimizer)
+                val_loss, val_acc = self.validate()
+
+                self.train_losses.append(train_loss)
+                self.val_losses.append(val_loss)
+                self.train_accs.append(train_acc)
+                self.val_accs.append(val_acc)
+                scheduler.step()
+
+                lr = optimizer.param_groups[0]['lr']
+                print(f"Epoch {global_epoch}")
+                print(f"  Train Loss: {train_loss:.4f}, Acc: {train_acc:.2f}%")
+                print(f"  Val   Loss: {val_loss:.4f}, Acc: {val_acc:.2f}%, LR: {lr:.6f}")
+
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    self.save(best_model_path)
+                    print(f"  ✓ Best model saved (Val Acc: {val_acc:.2f}%)")
+
+                if val_loss < best_phase1_val_loss:
+                    best_phase1_val_loss = val_loss
+                    no_improve_count = 0
+                else:
+                    no_improve_count += 1
+
+                # Checkpoint kaydet
+                self._save_checkpoint(
+                    checkpoint_path, global_epoch, 1, optimizer, scheduler,
+                    best_val_acc, actual_phase1_epochs,
+                    best_phase1_val_loss, no_improve_count,
+                    num_epochs, learning_rate,
+                )
+                print(f"  💾 Checkpoint saved")
+
+                if epoch >= min_phase1 and no_improve_count >= patience:
+                    actual_phase1_epochs = epoch + 1
+                    print(f"\n⏹️  Phase 1 early stopped at epoch {actual_phase1_epochs}")
+                    break
+
+                print("-" * 60)
             else:
-                no_improve_count += 1
-
-            if epoch >= min_phase1 and no_improve_count >= patience:
-                actual_phase1_epochs = epoch + 1
-                print(f"\n⏹️  Phase 1 early stopped at epoch {actual_phase1_epochs}")
-                break
-
-            print("-" * 60)
-        else:
-            actual_phase1_epochs = max_phase1
+                actual_phase1_epochs = max_phase1
 
         # ── Phase 2: Full fine-tuning ────────────────────────────────
-        phase2_epochs = num_epochs - actual_phase1_epochs
+        phase2_total = num_epochs - actual_phase1_epochs
         phase2_lr = learning_rate * 0.1
 
-        print(f"\n🎯 Phase 2: Full fine-tuning ({phase2_epochs} ep, lr={phase2_lr})")
+        # Resume: phase 2'den devam edeceksek başlangıç epoch hesapla
+        if resume and resume_phase == 2:
+            phase2_start = resume_epoch - actual_phase1_epochs
+        else:
+            phase2_start = 0
+
+        print(f"\n🎯 Phase 2: Full fine-tuning ({phase2_total} ep, lr={phase2_lr})")
+        if phase2_start > 0:
+            print(f"   ▶ Phase 2 epoch {phase2_start + 1}'den devam ediliyor")
         self.model.unfreeze_backbone()
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f"   Trainable: {trainable:,} / {total:,}")
         print("=" * 60)
 
         optimizer = optim.Adam(self.model.parameters(), lr=phase2_lr, weight_decay=1e-4)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=phase2_epochs)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=phase2_total)
 
-        for epoch in range(phase2_epochs):
+        # Resume: optimizer ve scheduler state'ini geri yükle
+        if resume and resume_phase == 2 and Path(checkpoint_path).exists():
+            ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+
+        for epoch in range(phase2_start, phase2_total):
             global_epoch = actual_phase1_epochs + epoch + 1
             train_loss, train_acc = self._train_one_epoch(global_epoch, criterion, optimizer)
             val_loss, val_acc = self.validate()
@@ -849,6 +965,14 @@ class CNNClassifier:
                 self.save(best_model_path)
                 print(f"  ✓ Best model saved (Val Acc: {val_acc:.2f}%)")
 
+            # Checkpoint kaydet
+            self._save_checkpoint(
+                checkpoint_path, global_epoch, 2, optimizer, scheduler,
+                best_val_acc, actual_phase1_epochs,
+                best_phase1_val_loss, no_improve_count,
+                num_epochs, learning_rate,
+            )
+            print(f"  💾 Checkpoint saved")
             print("-" * 60)
 
         print(f"\n✅ Training tamamlandı! Best Val Acc: {best_val_acc:.2f}%")
