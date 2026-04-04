@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 from pathlib import Path
 from src.models.ensemble_classifier import EnsembleClassifier
+from src.utils.image_ops import DEFAULT_CONTEXT_CROP_CONFIG, crop_with_context
 import json
 from datetime import datetime
 
@@ -78,7 +79,11 @@ class YOLOPostProcessor:
                 'reason': 'invalid_bbox'
             }
         
-        cropped = image[y1:y2, x1:x2]
+        cropped, _ = crop_with_context(
+            image,
+            (x1, y1, x2, y2),
+            **DEFAULT_CONTEXT_CROP_CONFIG,
+        )
         
         if cropped.size == 0:
             self.stats['rejected'] += 1

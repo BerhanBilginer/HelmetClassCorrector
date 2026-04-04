@@ -30,6 +30,8 @@ import seaborn as sns
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 from tqdm import tqdm
 
+from src.utils.image_ops import AspectRatioPadResize
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOSS FUNCTIONS
@@ -559,66 +561,82 @@ class CNNClassifier:
         print(f"🧠 Model: HelmetClassifierNet v5 ({img_size}×{img_size})")
         print(f"   Branch: {branch_type} | Loss: {loss_type} | Smoothing: {label_smoothing}")
         print(f"   Mixup α={mixup_alpha} | CutMix α={cutmix_alpha} | prob={mixup_prob}")
+        print("   Preprocess: aspect-ratio letterbox + tiny-safe augmentations")
 
         # ── Transforms ────────────────────────────────────────────────────
-        resize_size = int(img_size * 256 / 224)  # 256 for 224, 438 for 384
-
-        self.train_transform = transforms.Compose([
-            transforms.Resize((resize_size, resize_size)),
-            transforms.RandomResizedCrop(img_size, scale=(0.7, 1.0)),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomAffine(degrees=20, scale=(0.8, 1.2), translate=(0.1, 0.1)),
-            transforms.RandomPerspective(distortion_scale=0.3, p=0.4),
-            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.15),
-            transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225]),
-            transforms.RandomErasing(p=0.2, scale=(0.02, 0.15)),
-        ])
-
-        self.test_transform = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
-        ])
-
-        # TTA transform'ları
-        self._tta_transforms = [
-            self.test_transform,
-            # Horizontal flip
-            transforms.Compose([
-                transforms.Resize((img_size, img_size)),
-                transforms.RandomHorizontalFlip(p=1.0),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-            ]),
-            # Center crop (tighter)
-            transforms.Compose([
-                transforms.Resize((resize_size, resize_size)),
-                transforms.CenterCrop(img_size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-            ]),
-            # Slight scale down
-            transforms.Compose([
-                transforms.Resize((int(img_size * 0.9), int(img_size * 0.9))),
-                transforms.Pad(int(img_size * 0.05), fill=0),
-                transforms.Resize((img_size, img_size)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-            ]),
-        ]
+        self._configure_transforms()
 
         # ── History ───────────────────────────────────────────────────────
         self.train_losses = []
         self.val_losses = []
         self.train_accs = []
         self.val_accs = []
+
+    def _normalize_transform(self):
+        return transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
+
+    def _configure_transforms(self):
+        """
+        Build transforms around aspect-ratio-preserving letterbox instead of
+        stretch + random crop, which is harmful for tiny detections.
+        """
+        img_size = self.img_size
+
+        self.train_transform = transforms.Compose([
+            AspectRatioPadResize(img_size, scale_range=(0.92, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomApply([
+                transforms.RandomAffine(
+                    degrees=12,
+                    translate=(0.06, 0.06),
+                    scale=(0.95, 1.05),
+                    fill=0,
+                )
+            ], p=0.6),
+            transforms.RandomApply([
+                transforms.ColorJitter(
+                    brightness=0.25,
+                    contrast=0.25,
+                    saturation=0.15,
+                    hue=0.05,
+                )
+            ], p=0.5),
+            transforms.RandomApply([
+                transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))
+            ], p=0.1),
+            transforms.ToTensor(),
+            self._normalize_transform(),
+            transforms.RandomErasing(p=0.1, scale=(0.02, 0.08)),
+        ])
+
+        self.test_transform = transforms.Compose([
+            AspectRatioPadResize(img_size),
+            transforms.ToTensor(),
+            self._normalize_transform(),
+        ])
+
+        self._tta_transforms = [
+            self.test_transform,
+            transforms.Compose([
+                AspectRatioPadResize(img_size),
+                transforms.RandomHorizontalFlip(p=1.0),
+                transforms.ToTensor(),
+                self._normalize_transform(),
+            ]),
+            transforms.Compose([
+                AspectRatioPadResize(img_size, scale=0.95),
+                transforms.ToTensor(),
+                self._normalize_transform(),
+            ]),
+            transforms.Compose([
+                AspectRatioPadResize(img_size, scale=0.9),
+                transforms.ToTensor(),
+                self._normalize_transform(),
+            ]),
+        ]
 
     # ── Data ──────────────────────────────────────────────────────────────
 
@@ -1310,12 +1328,7 @@ class CNNClassifier:
             num_classes=2, pretrained=False, branch_type=saved_branch
         ).to(self.device)
 
-        self.test_transform = transforms.Compose([
-            transforms.Resize((saved_img_size, saved_img_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
-        ])
+        self._configure_transforms()
 
         # v4 → v5 state_dict uyumu: color_branch → side_branch
         state_dict = checkpoint['model_state_dict']
@@ -1438,7 +1451,7 @@ def main():
     )
 
     classifier.load(best_path)
-    results = classifier.evaluate(output_dir=args.output_dir)
+    results = classifier.evaluate(model_path=best_path)
 
     print(f"\n{'='*70}")
     print(f"✅ TRAINING TAMAMLANDI — Test Acc: {results['accuracy']:.4f}")

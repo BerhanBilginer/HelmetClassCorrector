@@ -23,7 +23,7 @@ from PIL import Image
 PROJECT_ROOT = Path(__file__).resolve().parent
 YOLOV9_DIR = PROJECT_ROOT / "yolov9"
 YOLO_WEIGHTS = PROJECT_ROOT / "models" / "trained" / "e200_scratch.pt"
-CNN_WEIGHTS = PROJECT_ROOT / "models" / "trained" / "helmet_classifier_v4.pth"
+CNN_WEIGHTS = PROJECT_ROOT / "models" / "trained" / "helmet_classifier_v5.pth"
 INPUT_DIR = PROJECT_ROOT / "test" / "images"
 OUTPUT_DIR = PROJECT_ROOT / "results" / "300326_results"
 
@@ -44,6 +44,7 @@ from utils.augmentations import letterbox
 # ── CNN import ──────────────────────────────────────────────────────────────
 sys.path.insert(0, str(PROJECT_ROOT))
 from src.models.cnn_classifier import CNNClassifier
+from src.utils.image_ops import DEFAULT_CONTEXT_CROP_CONFIG, crop_with_context
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -208,7 +209,13 @@ def main():
         crops = []
         valid_detections = []
         for d in detections:
-            crop = img_bgr[d["y1"]:d["y2"], d["x1"]:d["x2"]]
+            crop, _ = crop_with_context(
+                img_bgr,
+                (d["x1"], d["y1"], d["x2"], d["y2"]),
+                **DEFAULT_CONTEXT_CROP_CONFIG,
+            )
+            if crop.size == 0:
+                continue
             crops.append(crop)
             valid_detections.append(d)
 
@@ -315,15 +322,23 @@ def main():
             detections = yolo_detect(yolo_model, img_bgr, dev, imgsz, stride, conf_thres, iou_thres)
 
             # Batch CNN inference
-            crops_pil = [
-                Image.fromarray(bgr_to_rgb(img_bgr[d["y1"]:d["y2"], d["x1"]:d["x2"]]))
-                for d in detections
-            ]
+            crops_pil = []
+            valid_detections = []
+            for d in detections:
+                crop, _ = crop_with_context(
+                    img_bgr,
+                    (d["x1"], d["y1"], d["x2"], d["y2"]),
+                    **DEFAULT_CONTEXT_CROP_CONFIG,
+                )
+                if crop.size == 0:
+                    continue
+                crops_pil.append(Image.fromarray(bgr_to_rgb(crop)))
+                valid_detections.append(d)
             results = []
             if crops_pil:
                 batch_res = cnn_classifier.predict_batch(crops_pil, return_proba=True)
                 lmap = {0: "no_helmet", 1: "helmet"}
-                for d, br in zip(detections, batch_res):
+                for d, br in zip(valid_detections, batch_res):
                     results.append({
                         **d,
                         "label": lmap[br["prediction"]],

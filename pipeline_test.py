@@ -20,7 +20,7 @@ from torchvision import transforms
 PROJECT_ROOT = Path(__file__).resolve().parent
 YOLOV9_DIR = PROJECT_ROOT / "yolov9"
 YOLO_WEIGHTS = PROJECT_ROOT / "models" / "trained" / "e200_scratch.pt"
-CNN_WEIGHTS = PROJECT_ROOT / "models" / "trained" / "helmet_classifier_v4.pth"
+CNN_WEIGHTS = PROJECT_ROOT / "models" / "trained" / "helmet_classifier_v5.pth"
 INPUT_DIR = PROJECT_ROOT / "test" / "images"
 OUTPUT_DIR = PROJECT_ROOT / "results" / "300326_results"
 
@@ -41,6 +41,7 @@ from utils.augmentations import letterbox
 # ── CNN import ──────────────────────────────────────────────────────────────
 sys.path.insert(0, str(PROJECT_ROOT))
 from src.models.cnn_classifier import CNNClassifier
+from src.utils.image_ops import DEFAULT_CONTEXT_CROP_CONFIG, crop_with_context
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -178,10 +179,18 @@ def run_pipeline(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR,
 
         # Collect crops for batch inference
         crops_pil = []
+        valid_detections = []
         for det in detections:
-            crop_bgr = img_bgr[det["y1"]:det["y2"], det["x1"]:det["x2"]]
+            crop_bgr, _ = crop_with_context(
+                img_bgr,
+                (det["x1"], det["y1"], det["x2"], det["y2"]),
+                **DEFAULT_CONTEXT_CROP_CONFIG,
+            )
+            if crop_bgr.size == 0:
+                continue
             crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
             crops_pil.append(Image.fromarray(crop_rgb))
+            valid_detections.append(det)
 
         # Batch CNN classification
         image_results = []
@@ -189,7 +198,7 @@ def run_pipeline(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR,
             batch_results = cnn_classifier.predict_batch(crops_pil, return_proba=True)
             labels_map = {0: "no_helmet", 1: "helmet"}
 
-            for i, (det, br) in enumerate(zip(detections, batch_results)):
+            for i, (det, br) in enumerate(zip(valid_detections, batch_results)):
                 label = labels_map[br["prediction"]]
                 result = {
                     "x1": det["x1"], "y1": det["y1"],

@@ -1,6 +1,7 @@
-import cv2
+import argparse
 from pathlib import Path
-from tqdm import tqdm
+
+from src.utils.image_ops import DEFAULT_CONTEXT_CROP_CONFIG, crop_with_context
 
 def get_next_number(output_dir):
     """
@@ -36,7 +37,13 @@ def yolo_to_bbox(x_center, y_center, width, height, img_width, img_height):
     
     return x1, y1, x2, y2
 
-def crop_objects_from_dataset(dataset_path, output_base_path, class_mapping={1: 'helmet', 3: 'no_helmet'}):
+def crop_objects_from_dataset(
+    dataset_path,
+    output_base_path,
+    class_mapping={1: 'helmet', 3: 'no_helmet'},
+    use_dynamic_context=True,
+    context_crop_config=None,
+):
     """
     YOLO dataset'inden objeleri crop eder.
 
@@ -63,9 +70,27 @@ def crop_objects_from_dataset(dataset_path, output_base_path, class_mapping={1: 
         dataset_path: YOLO dataset ana klasörü (train, val, test içeren)
         output_base_path: Crop edilmiş görüntülerin kaydedileceği ana klasör
         class_mapping: Class ID'den klasör ismine mapping (varsayılan: {1: 'helmet', 3: 'no_helmet'})
+        use_dynamic_context: Küçük bbox'lara ekstra çevre bilgisi ekle
+        context_crop_config: Context crop ayarları sözlüğü
     """
     dataset_path = Path(dataset_path)
     output_base_path = Path(output_base_path)
+    context_crop_config = context_crop_config or DEFAULT_CONTEXT_CROP_CONFIG
+
+    try:
+        import cv2
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "OpenCV (cv2) is required to run the cropper. "
+            "Install project requirements before generating crops."
+        ) from exc
+    try:
+        from tqdm import tqdm
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "tqdm is required to run the cropper. "
+            "Install project requirements before generating crops."
+        ) from exc
     
     splits = ['train', 'val', 'test']
     output_dirs = {split: {} for split in splits}
@@ -83,6 +108,12 @@ def crop_objects_from_dataset(dataset_path, output_base_path, class_mapping={1: 
         print(f"  [{split}]")
         for class_id, folder_name in class_mapping.items():
             print(f"    • Class {class_id} ({folder_name}): {counters[split][class_id]}")
+    if use_dynamic_context:
+        print("🧭 Dynamic context crop: AÇIK")
+        for key, value in context_crop_config.items():
+            print(f"    • {key}: {value}")
+    else:
+        print("🧭 Dynamic context crop: KAPALI")
 
     total_crops = {
         split: {class_id: 0 for class_id in class_mapping.keys()}
@@ -156,16 +187,22 @@ def crop_objects_from_dataset(dataset_path, output_base_path, class_mapping={1: 
                     height = float(parts[4])
                     
                     x1, y1, x2, y2 = yolo_to_bbox(x_center, y_center, width, height, img_width, img_height)
-                    
-                    x1 = max(0, x1)
-                    y1 = max(0, y1)
-                    x2 = min(img_width, x2)
-                    y2 = min(img_height, y2)
-                    
+
                     if x2 <= x1 or y2 <= y1:
                         continue
-                    
-                    cropped_img = img[y1:y2, x1:x2]
+
+                    if use_dynamic_context:
+                        cropped_img, _ = crop_with_context(
+                            img,
+                            (x1, y1, x2, y2),
+                            **context_crop_config,
+                        )
+                    else:
+                        x1 = max(0, x1)
+                        y1 = max(0, y1)
+                        x2 = min(img_width, x2)
+                        y2 = min(img_height, y2)
+                        cropped_img = img[y1:y2, x1:x2]
                     
                     if cropped_img.size == 0:
                         continue
@@ -212,30 +249,87 @@ def crop_objects_from_dataset(dataset_path, output_base_path, class_mapping={1: 
     return total_crops
 
 if __name__ == "__main__":
-    dataset_path = '/home/berhan/Development/personal/HelmetClassCorrector/kiran_dataset'
-    output_path = '/home/berhan/Development/personal/HelmetClassCorrector/test/cropped_images'
-    
+    parser = argparse.ArgumentParser(
+        description="Crop YOLO-format detections into a split/class image dataset.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--dataset-path",
+        required=True,
+        help="YOLO dataset root. Expected: train/val/test with images/ and labels/.",
+    )
+    parser.add_argument(
+        "--output-path",
+        required=True,
+        help="Output root for cropped dataset.",
+    )
+    parser.add_argument(
+        "--helmet-class-id",
+        type=int,
+        default=1,
+        help="YOLO class id for helmet crops.",
+    )
+    parser.add_argument(
+        "--no-helmet-class-id",
+        type=int,
+        default=3,
+        help="YOLO class id for no_helmet crops.",
+    )
+    parser.add_argument(
+        "--disable-dynamic-context",
+        action="store_true",
+        help="Disable extra context for small boxes and use tight bbox crops only.",
+    )
+    parser.add_argument(
+        "--base-context-ratio",
+        type=float,
+        default=DEFAULT_CONTEXT_CROP_CONFIG["base_context_ratio"],
+        help="Base bbox padding ratio applied on each side.",
+    )
+    parser.add_argument(
+        "--min-context-px",
+        type=int,
+        default=DEFAULT_CONTEXT_CROP_CONFIG["min_context_px"],
+        help="Minimum extra pixels to pad around each bbox.",
+    )
+    parser.add_argument(
+        "--min-context-side",
+        type=int,
+        default=DEFAULT_CONTEXT_CROP_CONFIG["min_context_side"],
+        help="Boxes shorter than this get progressively more context.",
+    )
+    parser.add_argument(
+        "--max-context-ratio",
+        type=float,
+        default=DEFAULT_CONTEXT_CROP_CONFIG["max_context_ratio"],
+        help="Maximum extra padding relative to bbox size.",
+    )
+    args = parser.parse_args()
+
+    context_crop_config = {
+        "base_context_ratio": args.base_context_ratio,
+        "min_context_px": args.min_context_px,
+        "min_context_side": args.min_context_side,
+        "max_context_ratio": args.max_context_ratio,
+    }
+
     print("✂️  YOLO Dataset Cropper")
     print("=" * 60)
-    print("Bu script YOLO formatındaki label'ları kullanarak")
-    print("objeleri crop eder ve sınıflarına göre klasörlere kaydeder.")
+    print(f"Dataset: {args.dataset_path}")
+    print(f"Output:  {args.output_path}")
+    print(f"Class mapping: {args.helmet_class_id} -> helmet, {args.no_helmet_class_id} -> no_helmet")
+    print(f"Dynamic context: {'OFF' if args.disable_dynamic_context else 'ON'}")
     print("=" * 60)
-    print(f"\nDataset: {dataset_path}")
-    print(f"Output: {output_path}")
-    print(f"\nClass Mapping:")
-    print(f"  • Class 1 → <output>/<split>/helmet")
-    print(f"  • Class 3 → <output>/<split>/no_helmet")
-    print("=" * 60)
-    
-    response = input("\nDevam etmek istiyor musunuz? (y/n): ").lower()
-    
-    if response == 'y':
-        stats = crop_objects_from_dataset(
-            dataset_path=dataset_path,
-            output_base_path=output_path,
-            class_mapping={1: 'helmet', 3: 'no_helmet'}
-        )
-        
-        print("\n✅ İşlem başarıyla tamamlandı!")
-    else:
-        print("❌ İşlem iptal edildi.")
+
+    crop_objects_from_dataset(
+        dataset_path=args.dataset_path,
+        output_base_path=args.output_path,
+        class_mapping={
+            args.helmet_class_id: 'helmet',
+            args.no_helmet_class_id: 'no_helmet',
+        },
+        use_dynamic_context=not args.disable_dynamic_context,
+        context_crop_config=context_crop_config,
+    )
+
+    print("\n✅ İşlem başarıyla tamamlandı!")
