@@ -6,6 +6,9 @@ DEFAULT_CONTEXT_CROP_CONFIG = {
     'min_context_px': 4,
     'min_context_side': 64,
     'max_context_ratio': 2.0,
+    'side_context_scale': 1.15,
+    'top_context_scale': 1.6,
+    'bottom_context_scale': 0.55,
 }
 
 
@@ -29,12 +32,20 @@ def expand_bbox_with_context(
     min_context_px=4,
     min_context_side=64,
     max_context_ratio=2.0,
+    side_context_scale=1.15,
+    top_context_scale=1.6,
+    bottom_context_scale=0.55,
 ):
     """
     Expand small boxes more aggressively so tiny detections keep useful context.
 
     The crop is still bounded by the source image, but the requested padding grows
     when the shortest bbox side is below ``min_context_side``.
+
+    Padding is asymmetric on purpose:
+      - more room on the top keeps helmet shell / crown context
+      - modest extra room on the sides preserves silhouette
+      - less room on the bottom avoids over-weighting face / torso cues
     """
     x1, y1, x2, y2 = sanitize_bbox(x1, y1, x2, y2, image_width, image_height)
     box_w = max(1, x2 - x1)
@@ -45,14 +56,24 @@ def expand_bbox_with_context(
     pad_x = max(min_context_px, box_w * base_context_ratio, target_extra)
     pad_y = max(min_context_px, box_h * base_context_ratio, target_extra)
 
-    pad_x = int(round(min(pad_x, box_w * max_context_ratio)))
-    pad_y = int(round(min(pad_y, box_h * max_context_ratio)))
+    max_pad_x = box_w * max_context_ratio
+    max_pad_y = box_h * max_context_ratio
+
+    left_pad = int(round(min(pad_x * side_context_scale, max_pad_x)))
+    right_pad = int(round(min(pad_x * side_context_scale, max_pad_x)))
+    top_pad = int(round(min(pad_y * top_context_scale, max_pad_y)))
+    bottom_pad = int(round(min(pad_y * bottom_context_scale, max_pad_y)))
+
+    left_pad = max(min_context_px, left_pad)
+    right_pad = max(min_context_px, right_pad)
+    top_pad = max(min_context_px, top_pad)
+    bottom_pad = max(0, bottom_pad)
 
     return sanitize_bbox(
-        x1 - pad_x,
-        y1 - pad_y,
-        x2 + pad_x,
-        y2 + pad_y,
+        x1 - left_pad,
+        y1 - top_pad,
+        x2 + right_pad,
+        y2 + bottom_pad,
         image_width,
         image_height,
     )

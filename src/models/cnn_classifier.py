@@ -8,9 +8,10 @@ Değişiklikler (v4 → v5):
   ✦ 384×384 input desteği → ince detayları yakalama
   ✦ Test-Time Augmentation (TTA) → inference robustness
   ✦ Grad-CAM hook desteği → model debugging
+  ✦ Center-guided spatial prior → crop merkezindeki baş/helmet bölgesine odak
 
 Mimari:
-  EfficientNet-B0 backbone + CBAM + FPN + EdgeTexture Branch
+  EfficientNet-B0 backbone + CBAM + Center-Guided FPN + EdgeTexture Branch
   (128 FPN + 64 edge) = 192 → 128 → 64 → 2
 """
 
@@ -224,6 +225,40 @@ class CBAM(nn.Module):
         return x
 
 
+def build_center_prior(height, width, device, dtype, sigma_x=0.6, sigma_y=0.6):
+    """Create a broad 2D Gaussian prior that softly emphasizes the crop center."""
+    ys = torch.linspace(-1.0, 1.0, steps=height, device=device, dtype=dtype).view(1, 1, height, 1)
+    xs = torch.linspace(-1.0, 1.0, steps=width, device=device, dtype=dtype).view(1, 1, 1, width)
+    prior = torch.exp(-0.5 * ((xs / sigma_x) ** 2 + (ys / sigma_y) ** 2))
+    return prior
+
+
+class CenterPriorSpatialGate(nn.Module):
+    """
+    Lightweight guided attention that softly amplifies the crop center.
+
+    This is intentionally parameter-free so older checkpoints stay compatible.
+    """
+    def __init__(self, strength=0.35, sigma_x=0.6, sigma_y=0.6):
+        super().__init__()
+        self.strength = float(strength)
+        self.sigma_x = float(sigma_x)
+        self.sigma_y = float(sigma_y)
+
+    def forward(self, x):
+        prior = build_center_prior(
+            x.shape[2],
+            x.shape[3],
+            x.device,
+            x.dtype,
+            sigma_x=self.sigma_x,
+            sigma_y=self.sigma_y,
+        )
+        prior = prior / prior.mean(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+        gain = 1.0 + self.strength * (prior - 1.0)
+        return x * gain
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # DEFORMABLE CONVOLUTION
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -283,6 +318,26 @@ class AdaptiveFeaturePooling(nn.Module):
         concat = stacked.view(stacked.size(0), -1)
         weights = self.attention(concat).unsqueeze(2)
         return (stacked * weights).sum(dim=1)
+
+
+class CenterWeightedPooling(nn.Module):
+    """Pool features with a soft center prior instead of flat global averaging."""
+    def __init__(self, sigma_x=0.6, sigma_y=0.6):
+        super().__init__()
+        self.sigma_x = float(sigma_x)
+        self.sigma_y = float(sigma_y)
+
+    def forward(self, x):
+        weights = build_center_prior(
+            x.shape[2],
+            x.shape[3],
+            x.device,
+            x.dtype,
+            sigma_x=self.sigma_x,
+            sigma_y=self.sigma_y,
+        )
+        weights = weights / weights.sum(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+        return (x * weights).sum(dim=(2, 3))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -370,16 +425,26 @@ class HelmetClassifierNet(nn.Module):
 
     Mimari:
       Backbone:    EfficientNet-B0 features, 3 ölçek (40ch, 112ch, 1280ch)
-      Attention:   Her ölçekte CBAM
+      Attention:   Her ölçekte CBAM + merkez öncelikli spatial guidance
       FPN:         Top-down lateral, tüm ölçekler 128-dim
       Side Branch: EdgeTexture (grayscale + Sobel → 64-dim)
+      Pooling:     Center-weighted pooling + scale fusion
       Classifier:  (128 + 64) = 192 → 128 → 64 → 2
 
     Giriş: 224×224 veya 384×384 RGB
     """
-    def __init__(self, num_classes=2, pretrained=True, branch_type='edge_texture'):
+    def __init__(
+        self,
+        num_classes=2,
+        pretrained=True,
+        branch_type='edge_texture',
+        center_guidance=False,
+        center_guidance_strength=0.35,
+        center_guidance_sigma=0.6,
+    ):
         super().__init__()
         self.branch_type = branch_type
+        self.center_guidance = center_guidance
 
         weights = EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
         backbone = efficientnet_b0(weights=weights)
@@ -399,6 +464,21 @@ class HelmetClassifierNet(nn.Module):
         self.smooth2 = DeformableConv2d(128, 128, kernel_size=3, padding=1)
         self.smooth1 = DeformableConv2d(128, 128, kernel_size=3, padding=1)
 
+        self.center_guide_p5 = CenterPriorSpatialGate(
+            strength=center_guidance_strength,
+            sigma_x=center_guidance_sigma,
+            sigma_y=center_guidance_sigma,
+        )
+        self.center_guide_p4 = CenterPriorSpatialGate(
+            strength=center_guidance_strength,
+            sigma_x=center_guidance_sigma,
+            sigma_y=center_guidance_sigma,
+        )
+        self.center_guide_p3 = CenterPriorSpatialGate(
+            strength=center_guidance_strength,
+            sigma_x=center_guidance_sigma,
+            sigma_y=center_guidance_sigma,
+        )
         self.fpn_cbam3 = CBAM(128, reduction=8)
         self.fpn_cbam2 = CBAM(128, reduction=8)
         self.fpn_cbam1 = CBAM(128, reduction=8)
@@ -423,6 +503,10 @@ class HelmetClassifierNet(nn.Module):
             )
 
         self.adaptive_pooling = AdaptiveFeaturePooling(feature_dim=128, num_scales=3)
+        self.center_pool = CenterWeightedPooling(
+            sigma_x=center_guidance_sigma,
+            sigma_y=center_guidance_sigma,
+        )
 
         self.classifier = nn.Sequential(
             nn.Linear(128 + 64, 128),
@@ -488,15 +572,25 @@ class HelmetClassifierNet(nn.Module):
         p4 = self.smooth2(self.lateral2(c4) + F.interpolate(p5, size=c4.shape[2:], mode='nearest'))
         p3 = self.smooth1(self.lateral1(c3) + F.interpolate(p4, size=c3.shape[2:], mode='nearest'))
 
-        # Post-FPN CBAM
-        p5 = self.fpn_cbam3(p5)
-        p4 = self.fpn_cbam2(p4)
-        p3 = self.fpn_cbam1(p3)
+        if self.center_guidance:
+            # Post-FPN attention with a soft center prior.
+            p5 = self.fpn_cbam3(self.center_guide_p5(p5))
+            p4 = self.fpn_cbam2(self.center_guide_p4(p4))
+            p3 = self.fpn_cbam1(self.center_guide_p3(p3))
 
-        # Adaptive pooling
-        p5_pool = F.adaptive_avg_pool2d(p5, 1).view(x.size(0), -1)
-        p4_pool = F.adaptive_avg_pool2d(p4, 1).view(x.size(0), -1)
-        p3_pool = F.adaptive_avg_pool2d(p3, 1).view(x.size(0), -1)
+            # Center-weighted pooling suppresses edge/background clutter inside the crop.
+            p5_pool = self.center_pool(p5)
+            p4_pool = self.center_pool(p4)
+            p3_pool = self.center_pool(p3)
+        else:
+            p5 = self.fpn_cbam3(p5)
+            p4 = self.fpn_cbam2(p4)
+            p3 = self.fpn_cbam1(p3)
+
+            p5_pool = F.adaptive_avg_pool2d(p5, 1).view(x.size(0), -1)
+            p4_pool = F.adaptive_avg_pool2d(p4, 1).view(x.size(0), -1)
+            p3_pool = F.adaptive_avg_pool2d(p3, 1).view(x.size(0), -1)
+
         fpn_feat = self.adaptive_pooling([p3_pool, p4_pool, p5_pool])
 
         # Fuse + classify
@@ -525,7 +619,9 @@ class CNNClassifier:
     def __init__(self, device=None, model_type='efficientnet',
                  img_size=224, branch_type='edge_texture',
                  loss_type='focal', label_smoothing=0.1,
-                 mixup_alpha=0.4, cutmix_alpha=1.0, mixup_prob=0.5):
+                 mixup_alpha=0.4, cutmix_alpha=1.0, mixup_prob=0.5,
+                 center_guidance=False, center_guidance_strength=0.35,
+                 center_guidance_sigma=0.6):
 
         # ── Device ────────────────────────────────────────────────────────
         if device is None:
@@ -551,16 +647,22 @@ class CNNClassifier:
         self.mixup_alpha = mixup_alpha
         self.cutmix_alpha = cutmix_alpha
         self.mixup_prob = mixup_prob
+        self.center_guidance = center_guidance
+        self.center_guidance_strength = center_guidance_strength
+        self.center_guidance_sigma = center_guidance_sigma
 
         # ── Model ─────────────────────────────────────────────────────────
-        self.model = HelmetClassifierNet(
-            num_classes=2, pretrained=True, branch_type=branch_type
-        ).to(self.device)
+        self._build_model(pretrained=True)
         self.model.freeze_backbone()
 
         print(f"🧠 Model: HelmetClassifierNet v5 ({img_size}×{img_size})")
         print(f"   Branch: {branch_type} | Loss: {loss_type} | Smoothing: {label_smoothing}")
         print(f"   Mixup α={mixup_alpha} | CutMix α={cutmix_alpha} | prob={mixup_prob}")
+        attention_mode = "ON" if center_guidance else "OFF"
+        print(
+            "   Guided attention: "
+            f"{attention_mode} (strength={center_guidance_strength}, sigma={center_guidance_sigma})"
+        )
         print("   Preprocess: aspect-ratio letterbox + tiny-safe augmentations")
 
         # ── Transforms ────────────────────────────────────────────────────
@@ -571,6 +673,16 @@ class CNNClassifier:
         self.val_losses = []
         self.train_accs = []
         self.val_accs = []
+
+    def _build_model(self, pretrained):
+        self.model = HelmetClassifierNet(
+            num_classes=2,
+            pretrained=pretrained,
+            branch_type=self.branch_type,
+            center_guidance=self.center_guidance,
+            center_guidance_strength=self.center_guidance_strength,
+            center_guidance_sigma=self.center_guidance_sigma,
+        ).to(self.device)
 
     def _normalize_transform(self):
         return transforms.Normalize(
@@ -790,11 +902,42 @@ class CNNClassifier:
             'label_smoothing': self.label_smoothing,
             'mixup_alpha': self.mixup_alpha,
             'cutmix_alpha': self.cutmix_alpha,
+            'center_guidance': self.center_guidance,
+            'center_guidance_strength': self.center_guidance_strength,
+            'center_guidance_sigma': self.center_guidance_sigma,
         }, checkpoint_path)
 
     def _load_checkpoint(self, checkpoint_path):
         """Checkpoint'tan eğitim durumunu yükler."""
         ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+
+        saved_branch = ckpt.get('branch_type', self.branch_type)
+        saved_img_size = ckpt.get('img_size', self.img_size)
+        saved_center_guidance = ckpt.get('center_guidance', self.center_guidance)
+        saved_center_guidance_strength = ckpt.get(
+            'center_guidance_strength',
+            self.center_guidance_strength,
+        )
+        saved_center_guidance_sigma = ckpt.get(
+            'center_guidance_sigma',
+            self.center_guidance_sigma,
+        )
+
+        config_changed = (
+            saved_branch != self.branch_type
+            or saved_img_size != self.img_size
+            or saved_center_guidance != self.center_guidance
+            or saved_center_guidance_strength != self.center_guidance_strength
+            or saved_center_guidance_sigma != self.center_guidance_sigma
+        )
+        if config_changed:
+            self.branch_type = saved_branch
+            self.img_size = saved_img_size
+            self.center_guidance = saved_center_guidance
+            self.center_guidance_strength = saved_center_guidance_strength
+            self.center_guidance_sigma = saved_center_guidance_sigma
+            self._build_model(pretrained=False)
+            self._configure_transforms()
 
         # Model state yükle
         self.model.load_state_dict(ckpt['model_state_dict'])
@@ -1301,6 +1444,9 @@ class CNNClassifier:
             'label_smoothing': self.label_smoothing,
             'mixup_alpha': self.mixup_alpha,
             'cutmix_alpha': self.cutmix_alpha,
+            'center_guidance': self.center_guidance,
+            'center_guidance_strength': self.center_guidance_strength,
+            'center_guidance_sigma': self.center_guidance_sigma,
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
             'train_accs': self.train_accs,
@@ -1316,6 +1462,9 @@ class CNNClassifier:
         saved_type = checkpoint.get('model_type', 'efficientnet')
         saved_branch = checkpoint.get('branch_type', 'color')  # v4 default
         saved_img_size = checkpoint.get('img_size', 224)
+        saved_center_guidance = checkpoint.get('center_guidance', False)
+        saved_center_guidance_strength = checkpoint.get('center_guidance_strength', 0.35)
+        saved_center_guidance_sigma = checkpoint.get('center_guidance_sigma', 0.6)
 
         if saved_type != 'efficientnet':
             raise ValueError(f"Unsupported model_type='{saved_type}'.")
@@ -1323,10 +1472,11 @@ class CNNClassifier:
         # Branch type ve img_size güncelle
         self.branch_type = saved_branch
         self.img_size = saved_img_size
+        self.center_guidance = saved_center_guidance
+        self.center_guidance_strength = saved_center_guidance_strength
+        self.center_guidance_sigma = saved_center_guidance_sigma
 
-        self.model = HelmetClassifierNet(
-            num_classes=2, pretrained=False, branch_type=saved_branch
-        ).to(self.device)
+        self._build_model(pretrained=False)
 
         self._configure_transforms()
 
@@ -1347,6 +1497,11 @@ class CNNClassifier:
         print(f"✓ Model yüklendi: {filepath}")
         print(f"  Branch: {saved_branch} | Size: {saved_img_size} | "
               f"Epochs: {len(self.train_losses)}")
+        print(
+            "  Guided attention: "
+            f"{'ON' if self.center_guidance else 'OFF'} "
+            f"(strength={self.center_guidance_strength}, sigma={self.center_guidance_sigma})"
+        )
 
     # ── Visualization ─────────────────────────────────────────────────────
 
@@ -1413,6 +1568,9 @@ def main():
     parser.add_argument('--img-size', type=int, default=224, choices=[224, 384])
     parser.add_argument('--branch', type=str, default='edge_texture',
                         choices=['edge_texture', 'color'])
+    parser.add_argument('--disable-center-guidance', action='store_true')
+    parser.add_argument('--center-guidance-strength', type=float, default=0.35)
+    parser.add_argument('--center-guidance-sigma', type=float, default=0.6)
     parser.add_argument('--loss', type=str, default='focal', choices=['focal', 'ce'])
     parser.add_argument('--label-smoothing', type=float, default=0.1)
     parser.add_argument('--mixup-alpha', type=float, default=0.4)
@@ -1434,6 +1592,9 @@ def main():
         mixup_alpha=args.mixup_alpha,
         cutmix_alpha=args.cutmix_alpha,
         mixup_prob=args.mixup_prob,
+        center_guidance=not args.disable_center_guidance,
+        center_guidance_strength=args.center_guidance_strength,
+        center_guidance_sigma=args.center_guidance_sigma,
     )
 
     total_params = sum(p.numel() for p in classifier.model.parameters())

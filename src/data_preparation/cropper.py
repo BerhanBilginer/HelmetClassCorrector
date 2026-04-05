@@ -304,6 +304,24 @@ if __name__ == "__main__":
         default=DEFAULT_CONTEXT_CROP_CONFIG["max_context_ratio"],
         help="Maximum extra padding relative to bbox size.",
     )
+    parser.add_argument(
+        "--side-context-scale",
+        type=float,
+        default=DEFAULT_CONTEXT_CROP_CONFIG["side_context_scale"],
+        help="Horizontal padding multiplier to keep more helmet silhouette context.",
+    )
+    parser.add_argument(
+        "--top-context-scale",
+        type=float,
+        default=DEFAULT_CONTEXT_CROP_CONFIG["top_context_scale"],
+        help="Top padding multiplier so crops keep more helmet crown context.",
+    )
+    parser.add_argument(
+        "--bottom-context-scale",
+        type=float,
+        default=DEFAULT_CONTEXT_CROP_CONFIG["bottom_context_scale"],
+        help="Bottom padding multiplier to limit extra face/torso context.",
+    )
     args = parser.parse_args()
 
     context_crop_config = {
@@ -311,6 +329,9 @@ if __name__ == "__main__":
         "min_context_px": args.min_context_px,
         "min_context_side": args.min_context_side,
         "max_context_ratio": args.max_context_ratio,
+        "side_context_scale": args.side_context_scale,
+        "top_context_scale": args.top_context_scale,
+        "bottom_context_scale": args.bottom_context_scale,
     }
 
     print("✂️  YOLO Dataset Cropper")

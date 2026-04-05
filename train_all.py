@@ -49,6 +49,12 @@ def parse_args():
     parser.add_argument('--branch', type=str, default='edge_texture',
                         choices=['edge_texture', 'color'],
                         help='Side branch tipi: edge_texture (v5) veya color (v4 legacy)')
+    parser.add_argument('--disable-center-guidance', action='store_true',
+                        help='Merkez odaklı guided attention/pooling modülünü kapat')
+    parser.add_argument('--center-guidance-strength', type=float, default=0.35,
+                        help='Merkez prior etkisi (yüksek = merkez daha baskın)')
+    parser.add_argument('--center-guidance-sigma', type=float, default=0.6,
+                        help='Merkez prior genişliği (yüksek = daha yaygın merkez odağı)')
 
     # Loss & regularization
     parser.add_argument('--loss', type=str, default='focal', choices=['focal', 'ce'],
@@ -82,6 +88,8 @@ def main():
     print(f"\n📁 Dataset:         {args.dataset_dir}")
     print(f"📐 Input size:      {args.img_size}×{args.img_size}")
     print(f"🧠 Branch:          {args.branch}")
+    print(f"🎯 Center guidance: {'OFF' if args.disable_center_guidance else 'ON'} "
+          f"(strength={args.center_guidance_strength}, sigma={args.center_guidance_sigma})")
     print(f"📊 Epochs:          {args.epochs}")
     print(f"📦 Batch size:      {args.batch_size}")
     print(f"📈 Learning rate:   {args.lr}")
@@ -118,6 +126,9 @@ def main():
         mixup_alpha=args.mixup_alpha,
         cutmix_alpha=args.cutmix_alpha,
         mixup_prob=args.mixup_prob,
+        center_guidance=not args.disable_center_guidance,
+        center_guidance_strength=args.center_guidance_strength,
+        center_guidance_sigma=args.center_guidance_sigma,
     )
 
     total_params = sum(p.numel() for p in classifier.model.parameters())
