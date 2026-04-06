@@ -26,9 +26,9 @@ from PIL import Image
 PROJECT_ROOT = Path(__file__).resolve().parent
 YOLOV9_DIR = PROJECT_ROOT / "yolov9"
 YOLO_WEIGHTS = PROJECT_ROOT / "models" / "trained" / "e200_scratch.pt"
-CNN_WEIGHTS = PROJECT_ROOT / "models" / "trained" / "helmet_classifier_context_v1.pth"
+CNN_WEIGHTS = PROJECT_ROOT / "models" / "trained" / "helmet_classifier_center_guided_v1.pth"
 INPUT_DIR = PROJECT_ROOT / "test" / "images"
-OUTPUT_DIR = PROJECT_ROOT / "results" / "050426_results"
+OUTPUT_DIR = PROJECT_ROOT / "results" / "060426_results"
 ACTIVATION_OUTPUT_DIR = PROJECT_ROOT / "results" / "activation_debug"
 ACTIVATION_COMPARISON_OUTPUT_DIR = PROJECT_ROOT / "results" / "activation_debug_dual_target"
 
@@ -76,9 +76,10 @@ def get_cnn_model():
     return load_cnn_model()
 
 
-def load_cnn_model():
+def load_cnn_model(weights_path=None):
     classifier = CNNClassifier()
-    classifier.load(str(CNN_WEIGHTS))
+    model_path = Path(weights_path) if weights_path is not None else CNN_WEIGHTS
+    classifier.load(str(model_path))
     classifier.model.eval()
     return classifier
 

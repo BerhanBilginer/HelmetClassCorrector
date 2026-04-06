@@ -28,6 +28,18 @@ import sys
 import argparse
 from pathlib import Path
 
+DEFAULT_CENTER_GUIDANCE_SIGMA_X = 0.50
+DEFAULT_CENTER_GUIDANCE_SIGMA_Y = 0.42
+DEFAULT_CENTER_GUIDANCE_CENTER_X = 0.0
+DEFAULT_CENTER_GUIDANCE_CENTER_Y = -0.18
+
+DEFAULT_HELMET_FOCUS_LOSS_WEIGHT = 0.10
+DEFAULT_HELMET_FOCUS_SIGMA_X = 0.40
+DEFAULT_HELMET_FOCUS_SIGMA_Y = 0.24
+DEFAULT_HELMET_FOCUS_CENTER_X = 0.0
+DEFAULT_HELMET_FOCUS_CENTER_Y = -0.30
+DEFAULT_HELMET_FOCUS_OUTSIDE_PENALTY = 0.15
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -53,8 +65,16 @@ def parse_args():
                         help='Merkez odaklı guided attention/pooling modülünü kapat')
     parser.add_argument('--center-guidance-strength', type=float, default=0.35,
                         help='Merkez prior etkisi (yüksek = merkez daha baskın)')
-    parser.add_argument('--center-guidance-sigma', type=float, default=0.6,
-                        help='Merkez prior genişliği (yüksek = daha yaygın merkez odağı)')
+    parser.add_argument('--center-guidance-sigma', type=float, default=None,
+                        help='Legacy isotropic sigma. Verilirse sigma_x/sigma_y yerine kullanılır.')
+    parser.add_argument('--center-guidance-sigma-x', type=float, default=DEFAULT_CENTER_GUIDANCE_SIGMA_X,
+                        help='Merkez prior yatay genişliği')
+    parser.add_argument('--center-guidance-sigma-y', type=float, default=DEFAULT_CENTER_GUIDANCE_SIGMA_Y,
+                        help='Merkez prior dikey genişliği')
+    parser.add_argument('--center-guidance-center-x', type=float, default=DEFAULT_CENTER_GUIDANCE_CENTER_X,
+                        help='Merkez prior yatay kaydırma (-1 sol, +1 sağ)')
+    parser.add_argument('--center-guidance-center-y', type=float, default=DEFAULT_CENTER_GUIDANCE_CENTER_Y,
+                        help='Merkez prior dikey kaydırma (-1 yukarı, +1 aşağı)')
 
     # Loss & regularization
     parser.add_argument('--loss', type=str, default='focal', choices=['focal', 'ce'],
@@ -67,6 +87,18 @@ def parse_args():
                         help='CutMix alpha (0=kapalı)')
     parser.add_argument('--mixup-prob', type=float, default=0.5,
                         help='Her batch\'te mix uygulanma olasılığı')
+    parser.add_argument('--helmet-focus-loss-weight', type=float, default=DEFAULT_HELMET_FOCUS_LOSS_WEIGHT,
+                        help='Helmet örneklerinde üst-kask bölgesini teşvik eden yardımcı loss ağırlığı')
+    parser.add_argument('--helmet-focus-sigma-x', type=float, default=DEFAULT_HELMET_FOCUS_SIGMA_X,
+                        help='Helmet focus prior yatay genişliği')
+    parser.add_argument('--helmet-focus-sigma-y', type=float, default=DEFAULT_HELMET_FOCUS_SIGMA_Y,
+                        help='Helmet focus prior dikey genişliği')
+    parser.add_argument('--helmet-focus-center-x', type=float, default=DEFAULT_HELMET_FOCUS_CENTER_X,
+                        help='Helmet focus prior yatay kaydırma')
+    parser.add_argument('--helmet-focus-center-y', type=float, default=DEFAULT_HELMET_FOCUS_CENTER_Y,
+                        help='Helmet focus prior dikey kaydırma')
+    parser.add_argument('--helmet-focus-outside-penalty', type=float, default=DEFAULT_HELMET_FOCUS_OUTSIDE_PENALTY,
+                        help='Prior dışına kayan aktivasyonlara uygulanan ek ceza')
 
     # Output
     parser.add_argument('--output-dir', type=str, default='models/trained')
@@ -89,12 +121,17 @@ def main():
     print(f"📐 Input size:      {args.img_size}×{args.img_size}")
     print(f"🧠 Branch:          {args.branch}")
     print(f"🎯 Center guidance: {'OFF' if args.disable_center_guidance else 'ON'} "
-          f"(strength={args.center_guidance_strength}, sigma={args.center_guidance_sigma})")
+          f"(strength={args.center_guidance_strength}, sigma_x={args.center_guidance_sigma_x}, "
+          f"sigma_y={args.center_guidance_sigma_y}, center=({args.center_guidance_center_x}, "
+          f"{args.center_guidance_center_y}))")
     print(f"📊 Epochs:          {args.epochs}")
     print(f"📦 Batch size:      {args.batch_size}")
     print(f"📈 Learning rate:   {args.lr}")
     print(f"🎯 Loss:            {args.loss} (smoothing={args.label_smoothing})")
     print(f"🔀 Mixup α={args.mixup_alpha} | CutMix α={args.cutmix_alpha} | prob={args.mixup_prob}")
+    print(f"🪖 Helmet focus:    weight={args.helmet_focus_loss_weight} "
+          f"(sigma_x={args.helmet_focus_sigma_x}, sigma_y={args.helmet_focus_sigma_y}, "
+          f"center=({args.helmet_focus_center_x}, {args.helmet_focus_center_y}))")
     print(f"💾 Output:          {args.output_dir}/{args.model_name}")
     print("=" * 70)
 
@@ -129,6 +166,16 @@ def main():
         center_guidance=not args.disable_center_guidance,
         center_guidance_strength=args.center_guidance_strength,
         center_guidance_sigma=args.center_guidance_sigma,
+        center_guidance_sigma_x=args.center_guidance_sigma_x,
+        center_guidance_sigma_y=args.center_guidance_sigma_y,
+        center_guidance_center_x=args.center_guidance_center_x,
+        center_guidance_center_y=args.center_guidance_center_y,
+        helmet_focus_loss_weight=args.helmet_focus_loss_weight,
+        helmet_focus_sigma_x=args.helmet_focus_sigma_x,
+        helmet_focus_sigma_y=args.helmet_focus_sigma_y,
+        helmet_focus_center_x=args.helmet_focus_center_x,
+        helmet_focus_center_y=args.helmet_focus_center_y,
+        helmet_focus_outside_penalty=args.helmet_focus_outside_penalty,
     )
 
     total_params = sum(p.numel() for p in classifier.model.parameters())

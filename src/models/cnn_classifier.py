@@ -34,6 +34,48 @@ from tqdm import tqdm
 from src.utils.image_ops import AspectRatioPadResize
 
 
+DEFAULT_CENTER_GUIDANCE_SIGMA_X = 0.50
+DEFAULT_CENTER_GUIDANCE_SIGMA_Y = 0.42
+DEFAULT_CENTER_GUIDANCE_CENTER_X = 0.0
+DEFAULT_CENTER_GUIDANCE_CENTER_Y = -0.18
+
+DEFAULT_HELMET_FOCUS_LOSS_WEIGHT = 0.10
+DEFAULT_HELMET_FOCUS_SIGMA_X = 0.40
+DEFAULT_HELMET_FOCUS_SIGMA_Y = 0.24
+DEFAULT_HELMET_FOCUS_CENTER_X = 0.0
+DEFAULT_HELMET_FOCUS_CENTER_Y = -0.30
+DEFAULT_HELMET_FOCUS_OUTSIDE_PENALTY = 0.15
+
+
+def resolve_guidance_config(
+    legacy_sigma=None,
+    sigma_x=None,
+    sigma_y=None,
+    center_x=None,
+    center_y=None,
+    *,
+    default_sigma_x=DEFAULT_CENTER_GUIDANCE_SIGMA_X,
+    default_sigma_y=DEFAULT_CENTER_GUIDANCE_SIGMA_Y,
+    default_center_x=DEFAULT_CENTER_GUIDANCE_CENTER_X,
+    default_center_y=DEFAULT_CENTER_GUIDANCE_CENTER_Y,
+):
+    """Resolve legacy single-sigma config into explicit anisotropic prior values."""
+    if sigma_x is None:
+        sigma_x = legacy_sigma if legacy_sigma is not None else default_sigma_x
+    if sigma_y is None:
+        sigma_y = legacy_sigma if legacy_sigma is not None else default_sigma_y
+    if center_x is None:
+        center_x = default_center_x
+    if center_y is None:
+        center_y = default_center_y
+    return float(sigma_x), float(sigma_y), float(center_x), float(center_y)
+
+
+def legacy_guidance_sigma(sigma_x, sigma_y):
+    """Persist a backwards-compatible single sigma for older tooling."""
+    return float((float(sigma_x) + float(sigma_y)) / 2.0)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOSS FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -225,11 +267,28 @@ class CBAM(nn.Module):
         return x
 
 
-def build_center_prior(height, width, device, dtype, sigma_x=0.6, sigma_y=0.6):
-    """Create a broad 2D Gaussian prior that softly emphasizes the crop center."""
+def build_center_prior(
+    height,
+    width,
+    device,
+    dtype,
+    sigma_x=0.6,
+    sigma_y=0.6,
+    center_x=0.0,
+    center_y=0.0,
+):
+    """Create a 2D Gaussian prior that softly emphasizes a target crop region."""
     ys = torch.linspace(-1.0, 1.0, steps=height, device=device, dtype=dtype).view(1, 1, height, 1)
     xs = torch.linspace(-1.0, 1.0, steps=width, device=device, dtype=dtype).view(1, 1, 1, width)
-    prior = torch.exp(-0.5 * ((xs / sigma_x) ** 2 + (ys / sigma_y) ** 2))
+    sigma_x = max(float(sigma_x), 1e-3)
+    sigma_y = max(float(sigma_y), 1e-3)
+    prior = torch.exp(
+        -0.5
+        * (
+            (((xs - float(center_x)) / sigma_x) ** 2)
+            + (((ys - float(center_y)) / sigma_y) ** 2)
+        )
+    )
     return prior
 
 
@@ -239,11 +298,13 @@ class CenterPriorSpatialGate(nn.Module):
 
     This is intentionally parameter-free so older checkpoints stay compatible.
     """
-    def __init__(self, strength=0.35, sigma_x=0.6, sigma_y=0.6):
+    def __init__(self, strength=0.35, sigma_x=0.6, sigma_y=0.6, center_x=0.0, center_y=0.0):
         super().__init__()
         self.strength = float(strength)
         self.sigma_x = float(sigma_x)
         self.sigma_y = float(sigma_y)
+        self.center_x = float(center_x)
+        self.center_y = float(center_y)
 
     def forward(self, x):
         prior = build_center_prior(
@@ -253,6 +314,8 @@ class CenterPriorSpatialGate(nn.Module):
             x.dtype,
             sigma_x=self.sigma_x,
             sigma_y=self.sigma_y,
+            center_x=self.center_x,
+            center_y=self.center_y,
         )
         prior = prior / prior.mean(dim=(2, 3), keepdim=True).clamp_min(1e-6)
         gain = 1.0 + self.strength * (prior - 1.0)
@@ -322,10 +385,12 @@ class AdaptiveFeaturePooling(nn.Module):
 
 class CenterWeightedPooling(nn.Module):
     """Pool features with a soft center prior instead of flat global averaging."""
-    def __init__(self, sigma_x=0.6, sigma_y=0.6):
+    def __init__(self, sigma_x=0.6, sigma_y=0.6, center_x=0.0, center_y=0.0):
         super().__init__()
         self.sigma_x = float(sigma_x)
         self.sigma_y = float(sigma_y)
+        self.center_x = float(center_x)
+        self.center_y = float(center_y)
 
     def forward(self, x):
         weights = build_center_prior(
@@ -335,6 +400,8 @@ class CenterWeightedPooling(nn.Module):
             x.dtype,
             sigma_x=self.sigma_x,
             sigma_y=self.sigma_y,
+            center_x=self.center_x,
+            center_y=self.center_y,
         )
         weights = weights / weights.sum(dim=(2, 3), keepdim=True).clamp_min(1e-6)
         return (x * weights).sum(dim=(2, 3))
@@ -440,7 +507,10 @@ class HelmetClassifierNet(nn.Module):
         branch_type='edge_texture',
         center_guidance=False,
         center_guidance_strength=0.35,
-        center_guidance_sigma=0.6,
+        center_guidance_sigma_x=DEFAULT_CENTER_GUIDANCE_SIGMA_X,
+        center_guidance_sigma_y=DEFAULT_CENTER_GUIDANCE_SIGMA_Y,
+        center_guidance_center_x=DEFAULT_CENTER_GUIDANCE_CENTER_X,
+        center_guidance_center_y=DEFAULT_CENTER_GUIDANCE_CENTER_Y,
     ):
         super().__init__()
         self.branch_type = branch_type
@@ -466,18 +536,24 @@ class HelmetClassifierNet(nn.Module):
 
         self.center_guide_p5 = CenterPriorSpatialGate(
             strength=center_guidance_strength,
-            sigma_x=center_guidance_sigma,
-            sigma_y=center_guidance_sigma,
+            sigma_x=center_guidance_sigma_x,
+            sigma_y=center_guidance_sigma_y,
+            center_x=center_guidance_center_x,
+            center_y=center_guidance_center_y,
         )
         self.center_guide_p4 = CenterPriorSpatialGate(
             strength=center_guidance_strength,
-            sigma_x=center_guidance_sigma,
-            sigma_y=center_guidance_sigma,
+            sigma_x=center_guidance_sigma_x,
+            sigma_y=center_guidance_sigma_y,
+            center_x=center_guidance_center_x,
+            center_y=center_guidance_center_y,
         )
         self.center_guide_p3 = CenterPriorSpatialGate(
             strength=center_guidance_strength,
-            sigma_x=center_guidance_sigma,
-            sigma_y=center_guidance_sigma,
+            sigma_x=center_guidance_sigma_x,
+            sigma_y=center_guidance_sigma_y,
+            center_x=center_guidance_center_x,
+            center_y=center_guidance_center_y,
         )
         self.fpn_cbam3 = CBAM(128, reduction=8)
         self.fpn_cbam2 = CBAM(128, reduction=8)
@@ -504,8 +580,10 @@ class HelmetClassifierNet(nn.Module):
 
         self.adaptive_pooling = AdaptiveFeaturePooling(feature_dim=128, num_scales=3)
         self.center_pool = CenterWeightedPooling(
-            sigma_x=center_guidance_sigma,
-            sigma_y=center_guidance_sigma,
+            sigma_x=center_guidance_sigma_x,
+            sigma_y=center_guidance_sigma_y,
+            center_x=center_guidance_center_x,
+            center_y=center_guidance_center_y,
         )
 
         self.classifier = nn.Sequential(
@@ -555,7 +633,7 @@ class HelmetClassifierNet(nn.Module):
             for param in stage.parameters():
                 param.requires_grad = True
 
-    def forward(self, x):
+    def forward(self, x, return_aux=False):
         # Side branch (edge-texture veya color)
         if self.branch_type == 'edge_texture':
             side_feat = self.side_branch(x)
@@ -595,7 +673,26 @@ class HelmetClassifierNet(nn.Module):
 
         # Fuse + classify
         fused = torch.cat([fpn_feat, side_feat], dim=1)
-        return self.classifier(fused)
+        logits = self.classifier(fused)
+
+        if not return_aux:
+            return logits
+
+        aux = {
+            'fpn_maps': {
+                'p3': p3,
+                'p4': p4,
+                'p5': p5,
+            },
+            'fpn_pooled': {
+                'p3': p3_pool,
+                'p4': p4_pool,
+                'p5': p5_pool,
+            },
+            'fpn_fused': fpn_feat,
+            'side_feat': side_feat,
+        }
+        return logits, aux
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -621,7 +718,17 @@ class CNNClassifier:
                  loss_type='focal', label_smoothing=0.1,
                  mixup_alpha=0.4, cutmix_alpha=1.0, mixup_prob=0.5,
                  center_guidance=False, center_guidance_strength=0.35,
-                 center_guidance_sigma=0.6):
+                 center_guidance_sigma=None,
+                 center_guidance_sigma_x=DEFAULT_CENTER_GUIDANCE_SIGMA_X,
+                 center_guidance_sigma_y=DEFAULT_CENTER_GUIDANCE_SIGMA_Y,
+                 center_guidance_center_x=DEFAULT_CENTER_GUIDANCE_CENTER_X,
+                 center_guidance_center_y=DEFAULT_CENTER_GUIDANCE_CENTER_Y,
+                 helmet_focus_loss_weight=DEFAULT_HELMET_FOCUS_LOSS_WEIGHT,
+                 helmet_focus_sigma_x=DEFAULT_HELMET_FOCUS_SIGMA_X,
+                 helmet_focus_sigma_y=DEFAULT_HELMET_FOCUS_SIGMA_Y,
+                 helmet_focus_center_x=DEFAULT_HELMET_FOCUS_CENTER_X,
+                 helmet_focus_center_y=DEFAULT_HELMET_FOCUS_CENTER_Y,
+                 helmet_focus_outside_penalty=DEFAULT_HELMET_FOCUS_OUTSIDE_PENALTY):
 
         # ── Device ────────────────────────────────────────────────────────
         if device is None:
@@ -649,7 +756,28 @@ class CNNClassifier:
         self.mixup_prob = mixup_prob
         self.center_guidance = center_guidance
         self.center_guidance_strength = center_guidance_strength
-        self.center_guidance_sigma = center_guidance_sigma
+        (
+            self.center_guidance_sigma_x,
+            self.center_guidance_sigma_y,
+            self.center_guidance_center_x,
+            self.center_guidance_center_y,
+        ) = resolve_guidance_config(
+            legacy_sigma=center_guidance_sigma,
+            sigma_x=center_guidance_sigma_x,
+            sigma_y=center_guidance_sigma_y,
+            center_x=center_guidance_center_x,
+            center_y=center_guidance_center_y,
+        )
+        self.center_guidance_sigma = legacy_guidance_sigma(
+            self.center_guidance_sigma_x,
+            self.center_guidance_sigma_y,
+        )
+        self.helmet_focus_loss_weight = float(helmet_focus_loss_weight)
+        self.helmet_focus_sigma_x = float(helmet_focus_sigma_x)
+        self.helmet_focus_sigma_y = float(helmet_focus_sigma_y)
+        self.helmet_focus_center_x = float(helmet_focus_center_x)
+        self.helmet_focus_center_y = float(helmet_focus_center_y)
+        self.helmet_focus_outside_penalty = float(helmet_focus_outside_penalty)
 
         # ── Model ─────────────────────────────────────────────────────────
         self._build_model(pretrained=True)
@@ -661,7 +789,16 @@ class CNNClassifier:
         attention_mode = "ON" if center_guidance else "OFF"
         print(
             "   Guided attention: "
-            f"{attention_mode} (strength={center_guidance_strength}, sigma={center_guidance_sigma})"
+            f"{attention_mode} "
+            f"(strength={center_guidance_strength}, sigma_x={self.center_guidance_sigma_x}, "
+            f"sigma_y={self.center_guidance_sigma_y}, center=({self.center_guidance_center_x}, "
+            f"{self.center_guidance_center_y}))"
+        )
+        print(
+            "   Helmet focus loss: "
+            f"weight={self.helmet_focus_loss_weight} "
+            f"(sigma_x={self.helmet_focus_sigma_x}, sigma_y={self.helmet_focus_sigma_y}, "
+            f"center=({self.helmet_focus_center_x}, {self.helmet_focus_center_y}))"
         )
         print("   Preprocess: aspect-ratio letterbox + tiny-safe augmentations")
 
@@ -681,8 +818,53 @@ class CNNClassifier:
             branch_type=self.branch_type,
             center_guidance=self.center_guidance,
             center_guidance_strength=self.center_guidance_strength,
-            center_guidance_sigma=self.center_guidance_sigma,
+            center_guidance_sigma_x=self.center_guidance_sigma_x,
+            center_guidance_sigma_y=self.center_guidance_sigma_y,
+            center_guidance_center_x=self.center_guidance_center_x,
+            center_guidance_center_y=self.center_guidance_center_y,
         ).to(self.device)
+
+    def _compute_helmet_focus_loss(self, aux, labels):
+        """Encourage helmet samples to activate on the upper helmet shell region."""
+        if self.helmet_focus_loss_weight <= 0 or aux is None:
+            return None
+
+        helmet_mask = labels == 1
+        if not torch.any(helmet_mask):
+            return None
+
+        losses = []
+        for feature_map in aux['fpn_maps'].values():
+            helmet_features = feature_map[helmet_mask]
+            if helmet_features.numel() == 0:
+                continue
+
+            energy = helmet_features.abs().mean(dim=1, keepdim=True) + 1e-6
+            distribution = energy / energy.sum(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+
+            prior = build_center_prior(
+                distribution.shape[2],
+                distribution.shape[3],
+                distribution.device,
+                distribution.dtype,
+                sigma_x=self.helmet_focus_sigma_x,
+                sigma_y=self.helmet_focus_sigma_y,
+                center_x=self.helmet_focus_center_x,
+                center_y=self.helmet_focus_center_y,
+            )
+            prior = prior / prior.sum(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+            prior = prior.expand(distribution.shape[0], -1, -1, -1)
+
+            cross_entropy = -(prior * torch.log(distribution)).sum(dim=(2, 3))
+            entropy_scale = max(float(np.log(max(distribution.shape[2] * distribution.shape[3], 2))), 1.0)
+            cross_entropy = cross_entropy / entropy_scale
+            outside_weight = (1.0 - prior / prior.amax(dim=(2, 3), keepdim=True).clamp_min(1e-6)).clamp_min(0.0)
+            outside_energy = (distribution * outside_weight).sum(dim=(2, 3))
+            losses.append((cross_entropy + self.helmet_focus_outside_penalty * outside_energy).mean())
+
+        if not losses:
+            return None
+        return torch.stack(losses).mean()
 
     def _normalize_transform(self):
         return transforms.Normalize(
@@ -831,8 +1013,16 @@ class CNNClassifier:
             else:
                 # Normal training step
                 optimizer.zero_grad()
-                outputs = self.model(images)
+                need_aux = self.helmet_focus_loss_weight > 0 and torch.any(labels == 1)
+                if need_aux:
+                    outputs, aux = self.model(images, return_aux=True)
+                else:
+                    outputs = self.model(images)
+                    aux = None
                 loss = criterion(outputs, labels)
+                focus_loss = self._compute_helmet_focus_loss(aux, labels)
+                if focus_loss is not None:
+                    loss = loss + self.helmet_focus_loss_weight * focus_loss
                 loss.backward()
                 optimizer.step()
 
@@ -905,6 +1095,16 @@ class CNNClassifier:
             'center_guidance': self.center_guidance,
             'center_guidance_strength': self.center_guidance_strength,
             'center_guidance_sigma': self.center_guidance_sigma,
+            'center_guidance_sigma_x': self.center_guidance_sigma_x,
+            'center_guidance_sigma_y': self.center_guidance_sigma_y,
+            'center_guidance_center_x': self.center_guidance_center_x,
+            'center_guidance_center_y': self.center_guidance_center_y,
+            'helmet_focus_loss_weight': self.helmet_focus_loss_weight,
+            'helmet_focus_sigma_x': self.helmet_focus_sigma_x,
+            'helmet_focus_sigma_y': self.helmet_focus_sigma_y,
+            'helmet_focus_center_x': self.helmet_focus_center_x,
+            'helmet_focus_center_y': self.helmet_focus_center_y,
+            'helmet_focus_outside_penalty': self.helmet_focus_outside_penalty,
         }, checkpoint_path)
 
     def _load_checkpoint(self, checkpoint_path):
@@ -918,9 +1118,39 @@ class CNNClassifier:
             'center_guidance_strength',
             self.center_guidance_strength,
         )
-        saved_center_guidance_sigma = ckpt.get(
-            'center_guidance_sigma',
-            self.center_guidance_sigma,
+        has_explicit_guidance_shape = any(
+            key in ckpt
+            for key in (
+                'center_guidance_sigma_x',
+                'center_guidance_sigma_y',
+                'center_guidance_center_x',
+                'center_guidance_center_y',
+            )
+        )
+        saved_center_guidance_sigma_x, saved_center_guidance_sigma_y, _, _ = resolve_guidance_config(
+            legacy_sigma=ckpt.get('center_guidance_sigma'),
+            sigma_x=ckpt.get('center_guidance_sigma_x'),
+            sigma_y=ckpt.get('center_guidance_sigma_y'),
+            center_x=0.0,
+            center_y=0.0,
+            default_sigma_x=self.center_guidance_sigma_x,
+            default_sigma_y=self.center_guidance_sigma_y,
+            default_center_x=0.0,
+            default_center_y=0.0,
+        )
+        saved_center_guidance_center_x = ckpt.get('center_guidance_center_x', 0.0)
+        saved_center_guidance_center_y = ckpt.get(
+            'center_guidance_center_y',
+            self.center_guidance_center_y if has_explicit_guidance_shape else 0.0,
+        )
+        saved_helmet_focus_loss_weight = ckpt.get('helmet_focus_loss_weight', 0.0)
+        saved_helmet_focus_sigma_x = ckpt.get('helmet_focus_sigma_x', self.helmet_focus_sigma_x)
+        saved_helmet_focus_sigma_y = ckpt.get('helmet_focus_sigma_y', self.helmet_focus_sigma_y)
+        saved_helmet_focus_center_x = ckpt.get('helmet_focus_center_x', self.helmet_focus_center_x)
+        saved_helmet_focus_center_y = ckpt.get('helmet_focus_center_y', self.helmet_focus_center_y)
+        saved_helmet_focus_outside_penalty = ckpt.get(
+            'helmet_focus_outside_penalty',
+            self.helmet_focus_outside_penalty,
         )
 
         config_changed = (
@@ -928,14 +1158,36 @@ class CNNClassifier:
             or saved_img_size != self.img_size
             or saved_center_guidance != self.center_guidance
             or saved_center_guidance_strength != self.center_guidance_strength
-            or saved_center_guidance_sigma != self.center_guidance_sigma
+            or saved_center_guidance_sigma_x != self.center_guidance_sigma_x
+            or saved_center_guidance_sigma_y != self.center_guidance_sigma_y
+            or saved_center_guidance_center_x != self.center_guidance_center_x
+            or saved_center_guidance_center_y != self.center_guidance_center_y
+            or saved_helmet_focus_loss_weight != self.helmet_focus_loss_weight
+            or saved_helmet_focus_sigma_x != self.helmet_focus_sigma_x
+            or saved_helmet_focus_sigma_y != self.helmet_focus_sigma_y
+            or saved_helmet_focus_center_x != self.helmet_focus_center_x
+            or saved_helmet_focus_center_y != self.helmet_focus_center_y
+            or saved_helmet_focus_outside_penalty != self.helmet_focus_outside_penalty
         )
         if config_changed:
             self.branch_type = saved_branch
             self.img_size = saved_img_size
             self.center_guidance = saved_center_guidance
             self.center_guidance_strength = saved_center_guidance_strength
-            self.center_guidance_sigma = saved_center_guidance_sigma
+            self.center_guidance_sigma_x = saved_center_guidance_sigma_x
+            self.center_guidance_sigma_y = saved_center_guidance_sigma_y
+            self.center_guidance_center_x = saved_center_guidance_center_x
+            self.center_guidance_center_y = saved_center_guidance_center_y
+            self.center_guidance_sigma = legacy_guidance_sigma(
+                self.center_guidance_sigma_x,
+                self.center_guidance_sigma_y,
+            )
+            self.helmet_focus_loss_weight = saved_helmet_focus_loss_weight
+            self.helmet_focus_sigma_x = saved_helmet_focus_sigma_x
+            self.helmet_focus_sigma_y = saved_helmet_focus_sigma_y
+            self.helmet_focus_center_x = saved_helmet_focus_center_x
+            self.helmet_focus_center_y = saved_helmet_focus_center_y
+            self.helmet_focus_outside_penalty = saved_helmet_focus_outside_penalty
             self._build_model(pretrained=False)
             self._configure_transforms()
 
@@ -1447,6 +1699,16 @@ class CNNClassifier:
             'center_guidance': self.center_guidance,
             'center_guidance_strength': self.center_guidance_strength,
             'center_guidance_sigma': self.center_guidance_sigma,
+            'center_guidance_sigma_x': self.center_guidance_sigma_x,
+            'center_guidance_sigma_y': self.center_guidance_sigma_y,
+            'center_guidance_center_x': self.center_guidance_center_x,
+            'center_guidance_center_y': self.center_guidance_center_y,
+            'helmet_focus_loss_weight': self.helmet_focus_loss_weight,
+            'helmet_focus_sigma_x': self.helmet_focus_sigma_x,
+            'helmet_focus_sigma_y': self.helmet_focus_sigma_y,
+            'helmet_focus_center_x': self.helmet_focus_center_x,
+            'helmet_focus_center_y': self.helmet_focus_center_y,
+            'helmet_focus_outside_penalty': self.helmet_focus_outside_penalty,
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
             'train_accs': self.train_accs,
@@ -1464,7 +1726,40 @@ class CNNClassifier:
         saved_img_size = checkpoint.get('img_size', 224)
         saved_center_guidance = checkpoint.get('center_guidance', False)
         saved_center_guidance_strength = checkpoint.get('center_guidance_strength', 0.35)
-        saved_center_guidance_sigma = checkpoint.get('center_guidance_sigma', 0.6)
+        has_explicit_guidance_shape = any(
+            key in checkpoint
+            for key in (
+                'center_guidance_sigma_x',
+                'center_guidance_sigma_y',
+                'center_guidance_center_x',
+                'center_guidance_center_y',
+            )
+        )
+        saved_center_guidance_sigma_x, saved_center_guidance_sigma_y, _, _ = resolve_guidance_config(
+            legacy_sigma=checkpoint.get('center_guidance_sigma'),
+            sigma_x=checkpoint.get('center_guidance_sigma_x'),
+            sigma_y=checkpoint.get('center_guidance_sigma_y'),
+            center_x=0.0,
+            center_y=0.0,
+            default_sigma_x=DEFAULT_CENTER_GUIDANCE_SIGMA_X,
+            default_sigma_y=DEFAULT_CENTER_GUIDANCE_SIGMA_Y,
+            default_center_x=0.0,
+            default_center_y=0.0,
+        )
+        saved_center_guidance_center_x = checkpoint.get('center_guidance_center_x', 0.0)
+        saved_center_guidance_center_y = checkpoint.get(
+            'center_guidance_center_y',
+            DEFAULT_CENTER_GUIDANCE_CENTER_Y if has_explicit_guidance_shape else 0.0,
+        )
+        saved_helmet_focus_loss_weight = checkpoint.get('helmet_focus_loss_weight', 0.0)
+        saved_helmet_focus_sigma_x = checkpoint.get('helmet_focus_sigma_x', DEFAULT_HELMET_FOCUS_SIGMA_X)
+        saved_helmet_focus_sigma_y = checkpoint.get('helmet_focus_sigma_y', DEFAULT_HELMET_FOCUS_SIGMA_Y)
+        saved_helmet_focus_center_x = checkpoint.get('helmet_focus_center_x', DEFAULT_HELMET_FOCUS_CENTER_X)
+        saved_helmet_focus_center_y = checkpoint.get('helmet_focus_center_y', DEFAULT_HELMET_FOCUS_CENTER_Y)
+        saved_helmet_focus_outside_penalty = checkpoint.get(
+            'helmet_focus_outside_penalty',
+            DEFAULT_HELMET_FOCUS_OUTSIDE_PENALTY,
+        )
 
         if saved_type != 'efficientnet':
             raise ValueError(f"Unsupported model_type='{saved_type}'.")
@@ -1474,7 +1769,20 @@ class CNNClassifier:
         self.img_size = saved_img_size
         self.center_guidance = saved_center_guidance
         self.center_guidance_strength = saved_center_guidance_strength
-        self.center_guidance_sigma = saved_center_guidance_sigma
+        self.center_guidance_sigma_x = saved_center_guidance_sigma_x
+        self.center_guidance_sigma_y = saved_center_guidance_sigma_y
+        self.center_guidance_center_x = saved_center_guidance_center_x
+        self.center_guidance_center_y = saved_center_guidance_center_y
+        self.center_guidance_sigma = legacy_guidance_sigma(
+            self.center_guidance_sigma_x,
+            self.center_guidance_sigma_y,
+        )
+        self.helmet_focus_loss_weight = saved_helmet_focus_loss_weight
+        self.helmet_focus_sigma_x = saved_helmet_focus_sigma_x
+        self.helmet_focus_sigma_y = saved_helmet_focus_sigma_y
+        self.helmet_focus_center_x = saved_helmet_focus_center_x
+        self.helmet_focus_center_y = saved_helmet_focus_center_y
+        self.helmet_focus_outside_penalty = saved_helmet_focus_outside_penalty
 
         self._build_model(pretrained=False)
 
@@ -1500,7 +1808,15 @@ class CNNClassifier:
         print(
             "  Guided attention: "
             f"{'ON' if self.center_guidance else 'OFF'} "
-            f"(strength={self.center_guidance_strength}, sigma={self.center_guidance_sigma})"
+            f"(strength={self.center_guidance_strength}, sigma_x={self.center_guidance_sigma_x}, "
+            f"sigma_y={self.center_guidance_sigma_y}, center=({self.center_guidance_center_x}, "
+            f"{self.center_guidance_center_y}))"
+        )
+        print(
+            "  Helmet focus loss: "
+            f"weight={self.helmet_focus_loss_weight} "
+            f"(sigma_x={self.helmet_focus_sigma_x}, sigma_y={self.helmet_focus_sigma_y}, "
+            f"center=({self.helmet_focus_center_x}, {self.helmet_focus_center_y}))"
         )
 
     # ── Visualization ─────────────────────────────────────────────────────
@@ -1570,12 +1886,23 @@ def main():
                         choices=['edge_texture', 'color'])
     parser.add_argument('--disable-center-guidance', action='store_true')
     parser.add_argument('--center-guidance-strength', type=float, default=0.35)
-    parser.add_argument('--center-guidance-sigma', type=float, default=0.6)
+    parser.add_argument('--center-guidance-sigma', type=float, default=None,
+                        help='Legacy isotropic sigma. Verilirse sigma_x/sigma_y yerine kullanılır.')
+    parser.add_argument('--center-guidance-sigma-x', type=float, default=DEFAULT_CENTER_GUIDANCE_SIGMA_X)
+    parser.add_argument('--center-guidance-sigma-y', type=float, default=DEFAULT_CENTER_GUIDANCE_SIGMA_Y)
+    parser.add_argument('--center-guidance-center-x', type=float, default=DEFAULT_CENTER_GUIDANCE_CENTER_X)
+    parser.add_argument('--center-guidance-center-y', type=float, default=DEFAULT_CENTER_GUIDANCE_CENTER_Y)
     parser.add_argument('--loss', type=str, default='focal', choices=['focal', 'ce'])
     parser.add_argument('--label-smoothing', type=float, default=0.1)
     parser.add_argument('--mixup-alpha', type=float, default=0.4)
     parser.add_argument('--cutmix-alpha', type=float, default=1.0)
     parser.add_argument('--mixup-prob', type=float, default=0.5)
+    parser.add_argument('--helmet-focus-loss-weight', type=float, default=DEFAULT_HELMET_FOCUS_LOSS_WEIGHT)
+    parser.add_argument('--helmet-focus-sigma-x', type=float, default=DEFAULT_HELMET_FOCUS_SIGMA_X)
+    parser.add_argument('--helmet-focus-sigma-y', type=float, default=DEFAULT_HELMET_FOCUS_SIGMA_Y)
+    parser.add_argument('--helmet-focus-center-x', type=float, default=DEFAULT_HELMET_FOCUS_CENTER_X)
+    parser.add_argument('--helmet-focus-center-y', type=float, default=DEFAULT_HELMET_FOCUS_CENTER_Y)
+    parser.add_argument('--helmet-focus-outside-penalty', type=float, default=DEFAULT_HELMET_FOCUS_OUTSIDE_PENALTY)
     parser.add_argument('--output-dir', type=str, default='models/trained')
     parser.add_argument('--model-name', type=str, default='helmet_classifier_v5.pth')
     args = parser.parse_args()
@@ -1595,6 +1922,16 @@ def main():
         center_guidance=not args.disable_center_guidance,
         center_guidance_strength=args.center_guidance_strength,
         center_guidance_sigma=args.center_guidance_sigma,
+        center_guidance_sigma_x=args.center_guidance_sigma_x,
+        center_guidance_sigma_y=args.center_guidance_sigma_y,
+        center_guidance_center_x=args.center_guidance_center_x,
+        center_guidance_center_y=args.center_guidance_center_y,
+        helmet_focus_loss_weight=args.helmet_focus_loss_weight,
+        helmet_focus_sigma_x=args.helmet_focus_sigma_x,
+        helmet_focus_sigma_y=args.helmet_focus_sigma_y,
+        helmet_focus_center_x=args.helmet_focus_center_x,
+        helmet_focus_center_y=args.helmet_focus_center_y,
+        helmet_focus_outside_penalty=args.helmet_focus_outside_penalty,
     )
 
     total_params = sum(p.numel() for p in classifier.model.parameters())

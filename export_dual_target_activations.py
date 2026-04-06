@@ -15,6 +15,7 @@ from pathlib import Path
 from PIL import Image
 
 from streamlit_pipeline import (
+    CNN_WEIGHTS,
     INPUT_DIR,
     PROJECT_ROOT,
     get_gradcam_layers,
@@ -121,6 +122,12 @@ def main():
         default=PROJECT_ROOT / "results" / "activation_debug_dual_target_batch",
         help="Dual-target aktivasyon klasörü",
     )
+    parser.add_argument(
+        "--cnn-weights",
+        type=Path,
+        default=CNN_WEIGHTS,
+        help="Kullanılacak CNN ağırlık dosyası",
+    )
     parser.add_argument("--conf-thres", type=float, default=0.25)
     parser.add_argument("--iou-thres", type=float, default=0.45)
     parser.add_argument(
@@ -145,7 +152,7 @@ def main():
 
     print("Loading models...")
     yolo_model, dev, imgsz, stride = load_yolo_model()
-    cnn_classifier = load_cnn_model()
+    cnn_classifier = load_cnn_model(args.cnn_weights)
     layers = get_gradcam_layers(cnn_classifier)
 
     records = []
